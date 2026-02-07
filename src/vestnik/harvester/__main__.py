@@ -211,11 +211,59 @@ async def _cmd_login() -> None:
     print("")
 
 
+async def _cmd_login_qr() -> None:
+    if not TG_API_ID or not TG_API_HASH:
+        raise SystemExit("TG_API_ID/TG_API_HASH are required for login. Put them into .env")
+    logger.info("starting telegram login (qr)")
+    client = TelegramClient(StringSession(), TG_API_ID, TG_API_HASH)
+    await client.connect()
+    try:
+        qr = await client.qr_login()
+        url = getattr(qr, "url", "") or ""
+        if not url:
+            raise RuntimeError("qr login did not return a login url")
+
+        https_url = url
+        if url.startswith("tg://login?token="):
+            https_url = "https://t.me/login?token=" + url.split("token=", 1)[1]
+
+        print("")
+        print("Approve login on your phone (same Telegram account).")
+        print("Option A: open this link on the phone (it will open Telegram):")
+        print(url)
+        if https_url != url:
+            print("")
+            print("Option B (if tg:// link is not clickable):")
+            print(https_url)
+        print("")
+        print("Waiting for approval... (60s)")
+        try:
+            await qr.wait(timeout=60)
+        except asyncio.TimeoutError:
+            print("")
+            print("Timed out waiting for approval.")
+            print("Run the command again to get a fresh link.")
+            raise SystemExit(2)
+
+        session_str = client.session.save()
+    finally:
+        await client.disconnect()
+
+    print("")
+    print("Put this into .env")
+    print(f"TG_SESSION={session_str}")
+    print("HARVESTER_ENABLED=1")
+    print("")
+
+
 def main() -> None:
     import sys
     cmd = (sys.argv[1] if len(sys.argv) > 1 else "").strip().lower()
     if cmd in {"login", "auth"}:
         asyncio.run(_cmd_login())
+        return
+    if cmd in {"login-qr", "auth-qr", "qr"}:
+        asyncio.run(_cmd_login_qr())
         return
     asyncio.run(_run_loop())
 
