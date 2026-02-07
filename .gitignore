@@ -1,0 +1,15 @@
+.env
+.env.*
+*.session
+*.key
+*.pem
+*id_rsa*
+*id_ed25519*
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+dist/
+build/
+.DS_Store

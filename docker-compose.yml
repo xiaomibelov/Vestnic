@@ -1,0 +1,57 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: vestnik
+      POSTGRES_USER: vestnik
+      POSTGRES_PASSWORD: vestnik
+    ports:
+      - "5432:5432"
+    volumes:
+      - vestnik_pg:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  bot:
+    build: .
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    command: ["python", "-m", "vestnik.bot"]
+
+  worker:
+    build: .
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    command: ["python", "-m", "vestnik.worker"]
+
+  harvester:
+    build: .
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    command: ["python", "-m", "vestnik.harvester"]
+
+  web:
+    build: .
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    ports:
+      - "8000:8000"
+    command: ["python", "-m", "vestnik.web"]
+
+volumes:
+  vestnik_pg:

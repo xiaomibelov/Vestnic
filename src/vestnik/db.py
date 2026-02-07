@@ -1,0 +1,14 @@
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from vestnik.settings import DATABASE_URL
+
+engine = create_async_engine(DATABASE_URL, future=True)
+AsyncSessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+
+async def db_ping() -> bool:
+    try:
+        async with engine.connect() as conn:
+            await conn.exec_driver_sql("SELECT 1")
+        return True
+    except Exception:
+        return False
