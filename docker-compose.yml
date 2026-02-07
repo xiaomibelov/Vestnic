@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: vestnik
       POSTGRES_PASSWORD: vestnik
     ports:
-      - "5433:5432"
+      - "5434:5432"
     volumes:
       - vestnik_pg:/var/lib/postgresql/data
 
