@@ -236,9 +236,9 @@ async def _cmd_login_qr() -> None:
             print("Option B (if tg:// link is not clickable):")
             print(https_url)
         print("")
-        print("Waiting for approval... (60s)")
+        print("Waiting for approval... (180s)")
         try:
-            await qr.wait(timeout=60)
+            await qr.wait(timeout=180)
         except asyncio.TimeoutError:
             print("")
             print("Timed out waiting for approval.")
