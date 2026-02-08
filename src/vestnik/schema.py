@@ -305,9 +305,8 @@ async def ensure_schema(session: AsyncSession) -> None:
     await session.execute(text("create index if not exists ix_reports_created_at on reports(created_at);"))
 
     # --- ai cache ddl (non-destructive) ---
-    await session.execute(text('''
--- --- AI cache: per-post facts (Stage 1) ---
-CREATE TABLE IF NOT EXISTS post_facts (
+    for _stmt in [
+        '''CREATE TABLE IF NOT EXISTS post_facts (
   id SERIAL PRIMARY KEY,
   channel_ref TEXT NOT NULL,
   message_id TEXT NOT NULL,
@@ -318,18 +317,13 @@ CREATE TABLE IF NOT EXISTS post_facts (
   model TEXT NOT NULL DEFAULT '',
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE(channel_ref, message_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_post_facts_updated_at ON post_facts(updated_at DESC);
-
--- --- AI cache: report metadata (Stage 2 reuse) ---
-ALTER TABLE reports ADD COLUMN IF NOT EXISTS input_hash TEXT;
-ALTER TABLE reports ADD COLUMN IF NOT EXISTS stage2_model TEXT;
-ALTER TABLE reports ADD COLUMN IF NOT EXISTS stage1_count INTEGER;
-
-CREATE INDEX IF NOT EXISTS idx_reports_pack_period ON reports(pack_key, period_start, period_end);
-CREATE INDEX IF NOT EXISTS idx_reports_input_hash ON reports(input_hash);
-    '''))
-
-
+)''',
+        '''CREATE INDEX IF NOT EXISTS idx_post_facts_updated_at ON post_facts(updated_at DESC)''',
+        '''ALTER TABLE reports ADD COLUMN IF NOT EXISTS input_hash TEXT''',
+        '''ALTER TABLE reports ADD COLUMN IF NOT EXISTS stage2_model TEXT''',
+        '''ALTER TABLE reports ADD COLUMN IF NOT EXISTS stage1_count INTEGER''',
+        '''CREATE INDEX IF NOT EXISTS idx_reports_pack_period ON reports(pack_key, period_start, period_end)''',
+        '''CREATE INDEX IF NOT EXISTS idx_reports_input_hash ON reports(input_hash)''',
+    ]:
+        await session.execute(text(_stmt))
     await session.commit()
