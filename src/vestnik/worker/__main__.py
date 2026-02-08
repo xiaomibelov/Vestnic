@@ -9,6 +9,7 @@ from aiogram import Bot
 from sqlalchemy import text
 
 from vestnik.db import session_scope
+from vestnik.schema import ensure_schema
 from vestnik.settings import BOT_TOKEN
 
 logging.basicConfig(level=logging.INFO)
@@ -320,6 +321,10 @@ async def _oneshot() -> None:
     enabled = _env_bool("WORKER_ENABLED", True)
     dry = _env_bool("WORKER_DRY_RUN", False)
     max_posts = _env_int("WORKER_MAX_POSTS_PER_USER", 10)
+
+    async with session_scope() as session:
+        await ensure_schema(session)
+
     target_tg = os.environ.get("WORKER_TARGET_TG_ID", "").strip()
     preview_n = _env_int("WORKER_DRY_RUN_PREVIEW_N", 0)
 

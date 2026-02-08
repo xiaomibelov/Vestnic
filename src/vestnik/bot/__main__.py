@@ -11,6 +11,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from sqlalchemy import select, text
 
 from vestnik.db import session_scope
+from vestnik.schema import ensure_schema
 from vestnik.models import PostCache, User
 from vestnik.settings import BOT_TOKEN
 
@@ -1081,6 +1082,9 @@ async def action_router(cb: CallbackQuery):
 async def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is required")
+    async with session_scope() as session:
+        await ensure_schema(session)
+
     bot = Bot(token=BOT_TOKEN)
     await dp.start_polling(bot)
 
