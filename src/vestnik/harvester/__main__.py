@@ -32,7 +32,7 @@ def _now_utc() -> datetime:
 
 def _ttl_expires_at(now: datetime) -> datetime:
     ttl = POST_CACHE_TTL_HOURS
-    if ttl <= 0:
+    if not isinstance(ttl, int) or ttl <= 0:
         ttl = 48
     return now + timedelta(hours=ttl)
 
@@ -66,12 +66,15 @@ def _sanitize_tg_session(raw: str) -> str:
 
 def _make_client() -> TelegramClient | None:
     if not TG_API_ID or not TG_API_HASH:
+        logger.warning("missing TG_API_ID/TG_API_HASH")
         return None
     if not TG_SESSION:
+        logger.warning("missing TG_SESSION")
         return None
 
     sess = _sanitize_tg_session(TG_SESSION)
     if not sess:
+        logger.warning("empty TG_SESSION after sanitize")
         return None
 
     if "/" in sess or sess.endswith(".session"):
@@ -80,10 +83,7 @@ def _make_client() -> TelegramClient | None:
     try:
         return TelegramClient(StringSession(sess), TG_API_ID, TG_API_HASH)
     except (binascii.Error, ValueError) as e:
-        logger.error(
-            "invalid TG_SESSION (%s). Re-generate via `python -m vestnik.harvester login` and set TG_SESSION='...' in .env",
-            e,
-        )
+        logger.error("invalid TG_SESSION: %s", e)
         return None
 
 
@@ -138,7 +138,6 @@ async def _maybe_update_channel_meta(channel_id: int, tg_channel_id: int | None,
 
         changed = False
 
-        # IMPORTANT: model may not have these fields yet; guard by hasattr.
         if tg_channel_id is not None and hasattr(ch, "tg_channel_id"):
             cur = getattr(ch, "tg_channel_id", None)
             if not cur:
@@ -155,13 +154,13 @@ async def _maybe_update_channel_meta(channel_id: int, tg_channel_id: int | None,
             await session.commit()
 
 
-async def _harvest_one_channel(client: TelegramClient, ch: Channel) -> int:
+async def _harvest_one_channel(client: TelegramClient, ch: Channel) -> tuple[int, int]:
     channel_ref = ch.username.lstrip("@")
     last_id = await _last_message_id(channel_ref)
 
-    entity = await client.get_entity(channel_ref)
+    logger.info("harvest: start channel=%s last_id=%s", channel_ref, last_id)
 
-    # Safe meta update (no-op if model doesn't support those columns)
+    entity = await client.get_entity(channel_ref)
     await _maybe_update_channel_meta(ch.id, getattr(entity, "id", None), getattr(entity, "title", None))
 
     now = _now_utc()
@@ -171,11 +170,17 @@ async def _harvest_one_channel(client: TelegramClient, ch: Channel) -> int:
     if not isinstance(limit, int) or limit <= 0:
         limit = 50
 
+    scanned = 0
     collected: list[dict] = []
-    async for msg in client.iter_messages(entity, min_id=last_id, limit=limit, reverse=True):
-        if not msg:
-            continue
-        if not getattr(msg, "id", None):
+
+    kwargs = {"limit": limit}
+    if last_id > 0:
+        kwargs["min_id"] = last_id
+
+    # Берём последние сообщения (без reverse=True) — быстро и предсказуемо для первичного сидинга.
+    async for msg in client.iter_messages(entity, **kwargs):
+        scanned += 1
+        if not msg or not getattr(msg, "id", None):
             continue
 
         text = (getattr(msg, "raw_text", None) or getattr(msg, "message", None) or "").strip()
@@ -194,12 +199,44 @@ async def _harvest_one_channel(client: TelegramClient, ch: Channel) -> int:
             }
         )
 
-    return await _upsert_posts(channel_ref, collected)
+    inserted = await _upsert_posts(channel_ref, collected)
+    logger.info("harvest: done channel=%s scanned=%s inserted=%s", channel_ref, scanned, inserted)
+    return inserted, scanned
+
+
+async def _harvest_cycle(client: TelegramClient) -> int:
+    channels = await _fetch_active_channels()
+    logger.info("cycle: channels=%s", len(channels))
+
+    cleaned = await _cleanup_expired()
+    if cleaned:
+        logger.info("cleaned expired posts_cache rows=%s", cleaned)
+
+    total_inserted = 0
+    for ch in channels:
+        try:
+            inserted, _scanned = await _harvest_one_channel(client, ch)
+            total_inserted += inserted
+            await asyncio.sleep(0.2)
+        except FloodWaitError as e:
+            wait_s = int(getattr(e, "seconds", 0) or 0)
+            wait_s = max(wait_s, 1)
+            logger.warning("flood wait seconds=%s channel=%s", wait_s, ch.username)
+            await asyncio.sleep(wait_s + random.random())
+        except Exception as e:
+            logger.exception("harvest error channel=%s err=%s", ch.username, e)
+            await asyncio.sleep(1)
+
+    logger.info("cycle: inserted_total=%s", total_inserted)
+    return total_inserted
 
 
 async def _run_loop() -> None:
+    logger.info("harvester: start enabled=%s", bool(HARVESTER_ENABLED))
+
     if not HARVESTER_ENABLED:
         logger.warning("HARVESTER_ENABLED=0; harvester is idle")
+
     while True:
         if not HARVESTER_ENABLED:
             await asyncio.sleep(5)
@@ -207,41 +244,13 @@ async def _run_loop() -> None:
 
         client = _make_client()
         if client is None:
-            logger.warning("harvester disabled by config: TG_API_ID/TG_API_HASH/TG_SESSION not set or invalid")
+            logger.warning("harvester disabled by config (TG_* missing/invalid)")
             await asyncio.sleep(10)
             continue
 
         try:
             async with client:
-                channels = await _fetch_active_channels()
-                if not channels:
-                    await asyncio.sleep(max(5, HARVEST_INTERVAL_SEC if isinstance(HARVEST_INTERVAL_SEC, int) else 60))
-                    continue
-
-                cleaned = await _cleanup_expired()
-                if cleaned:
-                    logger.info("cleaned expired posts_cache rows=%s", cleaned)
-
-                total_inserted = 0
-                for ch in channels:
-                    try:
-                        inserted = await _harvest_one_channel(client, ch)
-                        total_inserted += inserted
-                        if inserted:
-                            logger.info("harvested channel=%s inserted=%s", ch.username, inserted)
-                        await asyncio.sleep(0.2)
-                    except FloodWaitError as e:
-                        wait_s = int(getattr(e, "seconds", 0) or 0)
-                        wait_s = max(wait_s, 1)
-                        logger.warning("flood wait seconds=%s channel=%s", wait_s, ch.username)
-                        await asyncio.sleep(wait_s + random.random())
-                    except Exception as e:
-                        logger.exception("harvest error channel=%s err=%s", ch.username, e)
-                        await asyncio.sleep(1)
-
-                if total_inserted:
-                    logger.info("harvest cycle done inserted_total=%s", total_inserted)
-
+                await _harvest_cycle(client)
         except Exception as e:
             logger.exception("harvester cycle error err=%s", e)
 
@@ -266,12 +275,24 @@ async def _cmd_login() -> None:
     print("")
 
 
+async def _cmd_oneshot() -> None:
+    client = _make_client()
+    if client is None:
+        raise SystemExit("TG_* config missing/invalid; cannot run oneshot")
+    async with client:
+        inserted = await _harvest_cycle(client)
+    print(f"ONESHOOT: inserted_total={inserted}")
+
+
 def main() -> None:
     import sys
 
     cmd = (sys.argv[1] if len(sys.argv) > 1 else "").strip().lower()
     if cmd in {"login", "auth"}:
         asyncio.run(_cmd_login())
+        return
+    if cmd in {"oneshot", "seed"}:
+        asyncio.run(_cmd_oneshot())
         return
     asyncio.run(_run_loop())
 
