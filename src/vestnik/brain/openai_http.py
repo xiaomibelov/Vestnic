@@ -2,46 +2,100 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import httpx
 
-from vestnik.settings import AI_HTTP_TIMEOUT_SEC, OPENAI_API_KEY, OPENAI_BASE_URL
+
+@dataclass(frozen=True)
+class OpenAIConfig:
+    api_key: str
+    base_url: str = "https://api.openai.com/v1"
+    max_retries: int = 3
+    retry_sleep_sec: int = 30
+    timeout_sec: int = 60
 
 
-class LLMError(RuntimeError):
-    pass
+def _extract_text(resp: dict) -> str:
+    # chat.completions -> choices[0].message.content
+    try:
+        return (resp["choices"][0]["message"]["content"] or "").strip()
+    except Exception:
+        return ""
 
 
-async def chat_completions(model: str, system: str, user: str, temperature: float = 0.2) -> str:
-    if not OPENAI_API_KEY:
-        raise LLMError("OPENAI_API_KEY is not set")
+def _parse_json_best_effort(s: str) -> Any:
+    s = s.strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        # attempt to cut array/object
+        for left, right in [("[", "]"), ("{", "}")]:
+            li = s.find(left)
+            ri = s.rfind(right)
+            if li != -1 and ri != -1 and ri > li:
+                chunk = s[li : ri + 1]
+                return json.loads(chunk)
+        raise
 
-    url = OPENAI_BASE_URL.rstrip("/") + "/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
-    payload: dict[str, Any] = {
+async def chat_completion(
+    cfg: OpenAIConfig,
+    *,
+    model: str,
+    messages: list[dict[str, str]],
+    temperature: float = 0.2,
+    max_tokens: int = 1200,
+) -> dict:
+    url = cfg.base_url.rstrip("/") + "/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {cfg.api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
         "model": model,
+        "messages": messages,
         "temperature": float(temperature),
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        "max_tokens": int(max_tokens),
     }
 
-    last_err: Exception | None = None
-    for attempt in range(1, 4):
-        try:
-            async with httpx.AsyncClient(timeout=AI_HTTP_TIMEOUT_SEC) as client:
-                r = await client.post(url, headers=headers, json=payload)
-                r.raise_for_status()
-                data = r.json()
-                return str(data["choices"][0]["message"]["content"])
-        except Exception as e:
-            last_err = e
-            if attempt < 3:
-                await asyncio.sleep(30)
-                continue
-            break
+    last_err: Optional[Exception] = None
+    async with httpx.AsyncClient(timeout=cfg.timeout_sec) as client:
+        for attempt in range(1, cfg.max_retries + 1):
+            try:
+                r = await client.post(url, headers=headers, content=json.dumps(payload))
+                if r.status_code >= 400:
+                    raise RuntimeError(f"OpenAI HTTP {r.status_code}: {r.text[:2000]}")
+                return r.json()
+            except Exception as e:
+                last_err = e
+                if attempt < cfg.max_retries:
+                    await asyncio.sleep(cfg.retry_sleep_sec)
+                else:
+                    raise
+    raise last_err or RuntimeError("OpenAI request failed")
 
-    raise LLMError(f"LLM request failed after 3 attempts: {last_err}")
+
+async def chat_text(
+    cfg: OpenAIConfig,
+    *,
+    model: str,
+    messages: list[dict[str, str]],
+    temperature: float = 0.2,
+    max_tokens: int = 1200,
+) -> str:
+    resp = await chat_completion(cfg, model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
+    return _extract_text(resp)
+
+
+async def chat_json(
+    cfg: OpenAIConfig,
+    *,
+    model: str,
+    messages: list[dict[str, str]],
+    temperature: float = 0.2,
+    max_tokens: int = 1200,
+) -> Any:
+    txt = await chat_text(cfg, model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
+    return _parse_json_best_effort(txt)

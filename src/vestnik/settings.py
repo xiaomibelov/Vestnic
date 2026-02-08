@@ -45,3 +45,16 @@ OPENAI_BASE_URL = env("OPENAI_BASE_URL", "https://api.openai.com/v1") or "https:
 AI_STAGE1_MODEL = env("AI_STAGE1_MODEL", "gpt-4o-mini") or "gpt-4o-mini"
 AI_STAGE2_MODEL = env("AI_STAGE2_MODEL", "gpt-4o") or "gpt-4o"
 AI_HTTP_TIMEOUT_SEC = env_int("AI_HTTP_TIMEOUT_SEC", 60)
+
+# --- AI (The Brain) ---
+AI_ENABLED = env_bool("AI_ENABLED", True)
+AI_CACHE_ENABLED = env_bool("AI_CACHE_ENABLED", True)
+
+OPENAI_API_KEY = env("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = env("OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+AI_STAGE1_MODEL = env("AI_STAGE1_MODEL", "gpt-4o-mini")
+AI_STAGE2_MODEL = env("AI_STAGE2_MODEL", "gpt-4o")
+
+AI_MAX_RETRIES = env_int("AI_MAX_RETRIES", 3)
+AI_RETRY_SLEEP_SEC = env_int("AI_RETRY_SLEEP_SEC", 30)
