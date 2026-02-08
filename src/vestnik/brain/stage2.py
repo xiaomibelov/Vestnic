@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 
 import hashlib
 import json
@@ -55,8 +56,8 @@ async def run_stage2(
     prompt_text: str,
     items: list[Stage1Item],
 ) -> tuple[str, str]:
-    if not (DEEPSEEK_API_KEY or OPENAI_API_KEY):
-    raise RuntimeError("AI API key is empty (set DEEPSEEK_API_KEY or OPENAI_API_KEY)")
+    if not (os.getenv("DEEPSEEK_API_KEY","") or os.getenv("OPENAI_API_KEY","")):
+        raise RuntimeError("AI API key is empty (set DEEPSEEK_API_KEY or OPENAI_API_KEY)")
 cfg = OpenAIConfig(
         api_key=OPENAI_API_KEY,
         base_url=OPENAI_BASE_URL,

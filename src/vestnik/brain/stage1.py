@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 
 import hashlib
 from dataclasses import dataclass
@@ -29,8 +30,8 @@ def _sha256_text(s: str) -> str:
 
 
 async def run_stage1(*, model: str, posts: list[dict[str, str]]) -> list[Stage1Item]:
-    if not (DEEPSEEK_API_KEY or OPENAI_API_KEY):
-    raise RuntimeError("AI API key is empty (set DEEPSEEK_API_KEY or OPENAI_API_KEY)")
+    if not (os.getenv("DEEPSEEK_API_KEY","") or os.getenv("OPENAI_API_KEY","")):
+        raise RuntimeError("AI API key is empty (set DEEPSEEK_API_KEY or OPENAI_API_KEY)")
 cfg = OpenAIConfig(
         api_key=OPENAI_API_KEY,
         base_url=OPENAI_BASE_URL,
