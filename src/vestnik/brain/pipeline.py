@@ -35,6 +35,12 @@ def _sha256_text(s: str) -> str:
     return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
 
 
+def _utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(microsecond=0)
+
+
 async def _load_prompt(session, pack_key: str) -> str:
     row = (await session.execute(text("select text from prompts where key=:k limit 1"), {"k": pack_key})).first()
     if row and str(row[0]).strip():
@@ -49,7 +55,12 @@ async def _load_prompt(session, pack_key: str) -> str:
 
 
 async def _load_pack(session, pack_key: str) -> tuple[int, str]:
-    row = (await session.execute(text("select id, title from packs where key=:k and is_active=true limit 1"), {"k": pack_key})).first()
+    row = (
+        await session.execute(
+            text("select id, title from packs where key=:k and is_active=true limit 1"),
+            {"k": pack_key},
+        )
+    ).first()
     if not row:
         raise RuntimeError(f"pack not found or inactive: {pack_key}")
     return int(row[0]), str(row[1])
@@ -179,11 +190,27 @@ async def _reports_columns(session) -> set[str]:
     return {str(c) for c in cols}
 
 
+async def _pick_user_id(session, user_tg_id: int | None) -> int:
+    if user_tg_id is not None:
+        row = (
+            await session.execute(
+                text("select id from users where tg_id=:tg limit 1"),
+                {"tg": int(user_tg_id)},
+            )
+        ).first()
+        if not row:
+            raise RuntimeError(f"user not found by tg_id={user_tg_id}")
+        return int(row[0])
+    row = (await session.execute(text("select id from users order by id limit 1"))).first()
+    if not row:
+        raise RuntimeError("no users in DB")
+    return int(row[0])
+
+
 async def _load_cached_report(session, *, user_id: int, pack_key: str, start: datetime, end: datetime, input_hash: str) -> str | None:
     cols = await _reports_columns(session)
     if "input_hash" not in cols:
         return None
-    # choose text column
     text_col = "report_text" if "report_text" in cols else ("text" if "text" in cols else None)
     if not text_col:
         return None
@@ -195,11 +222,16 @@ async def _load_cached_report(session, *, user_id: int, pack_key: str, start: da
         order by id desc
         limit 1
     """)
-    row = (await session.execute(q, {"uid": user_id, "pk": pack_key, "ps": start, "pe": end, "ih": input_hash})).first()
+    row = (
+        await session.execute(
+            q,
+            {"uid": user_id, "pk": pack_key, "ps": start, "pe": end, "ih": input_hash},
+        )
+    ).first()
     return str(row[0]) if row and row[0] else None
 
 
-async def _save_report(session, *, user_id: int, res: ReportResult, prompt_text: str) -> None:
+async def _save_report(session, *, user_id: int, res: ReportResult) -> None:
     cols = await _reports_columns(session)
 
     sources_json = json.dumps(
@@ -220,7 +252,6 @@ async def _save_report(session, *, user_id: int, res: ReportResult, prompt_text:
         "stage1_count": len(res.sources),
     }
 
-    # Build insert only for existing columns
     insert_cols = []
     params = {}
     for k, v in values.items():
@@ -228,12 +259,7 @@ async def _save_report(session, *, user_id: int, res: ReportResult, prompt_text:
             insert_cols.append(k)
             params[k] = v
 
-    if "created_at" in cols:
-        # rely on default if exists; do not pass
-        pass
-
     if "report_text" not in cols and "text" in cols:
-        # fallback: write into legacy 'text'
         params["text"] = res.report_text
         insert_cols.append("text")
 
@@ -251,24 +277,28 @@ async def _save_report(session, *, user_id: int, res: ReportResult, prompt_text:
     await session.commit()
 
 
-async def _pick_user_id(session, user_tg_id: int | None) -> int:
-    if user_tg_id is not None:
-        row = (await session.execute(text("select id from users where tg_id=:tg limit 1"), {"tg": int(user_tg_id)})).first()
-        if not row:
-            raise RuntimeError(f"user not found by tg_id={user_tg_id}")
-        return int(row[0])
-    row = (await session.execute(text("select id from users order by id limit 1"))).first()
-    if not row:
-        raise RuntimeError("no users in DB")
-    return int(row[0])
-
-
-async def generate_report(pack_key: str, hours: int = 24, limit: int = 120, *, user_tg_id: int | None = None, save: bool = False) -> ReportResult:
+async def generate_report(
+    *,
+    pack_key: str,
+    hours: int = 24,
+    limit: int = 120,
+    user_tg_id: int | None = None,
+    save: bool = False,
+    period_start: datetime | None = None,
+    period_end: datetime | None = None,
+) -> ReportResult:
     if not AI_ENABLED:
         raise RuntimeError("AI_ENABLED=0")
 
-    end = datetime.now(timezone.utc).replace(microsecond=0)
-    start = (end - timedelta(hours=int(hours))).replace(microsecond=0)
+    if period_end is not None:
+        end = _utc(period_end)
+    else:
+        end = datetime.now(timezone.utc).replace(microsecond=0)
+
+    if period_start is not None:
+        start = _utc(period_start)
+    else:
+        start = (end - timedelta(hours=int(hours))).replace(microsecond=0)
 
     async with session_scope() as session:
         await ensure_schema(session)
@@ -289,10 +319,9 @@ async def generate_report(pack_key: str, hours: int = 24, limit: int = 120, *, u
             res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, [], None, None)
             if save:
                 uid = await _pick_user_id(session, user_tg_id)
-                await _save_report(session, user_id=uid, res=res, prompt_text=prompt_text)
+                await _save_report(session, user_id=uid, res=res)
             return res
 
-        # compute hashes
         for p in posts:
             p["text_sha256"] = _sha256_text(p.get("text", ""))
 
@@ -327,16 +356,13 @@ async def generate_report(pack_key: str, hours: int = 24, limit: int = 120, *, u
 
         log.info("stage1 cache: cached=%s need_process=%s total_posts=%s", cached, len(to_process), len(posts))
 
-        new_items: list[Stage1Item] = []
         if to_process:
             new_items = await run_stage1(model=AI_STAGE1_MODEL, posts=to_process)
             await _upsert_facts(session, new_items)
             await session.commit()
-
             for it in new_items:
                 stage1_items[(it.channel_ref, it.message_id)] = it
 
-        # Keep stable ordering: newest first by posts order
         ordered: list[Stage1Item] = []
         for p in posts:
             k = (p["channel_ref"], p["message_id"])
@@ -351,15 +377,9 @@ async def generate_report(pack_key: str, hours: int = 24, limit: int = 120, *, u
             res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, ordered, None, None)
             if save:
                 uid = await _pick_user_id(session, user_tg_id)
-                await _save_report(session, user_id=uid, res=res, prompt_text=prompt_text)
+                await _save_report(session, user_id=uid, res=res)
             return res
 
-        # Stage2 reuse: compute a deterministic input hash the same way stage2 does
-        # We call stage2 to compute hash+text; but to avoid spending tokens, we compute hash by calling stage2 helper is embedded.
-        # Instead: do a cheap pre-hash using the same hashing method in stage2 via dry call pattern.
-        # Practical: call stage2 only if cached report not found.
-        # We'll compute hash using run_stage2 (it returns both text and hash). But that would spend tokens.
-        # So: compute a local prehash consistent with stage2 hashing: sha256(payload json)
         payload = {
             "pack_key": pack_key,
             "start": start.isoformat(),
@@ -385,7 +405,14 @@ async def generate_report(pack_key: str, hours: int = 24, limit: int = 120, *, u
             uid = await _pick_user_id(session, user_tg_id)
 
         if save and uid is not None:
-            cached_text = await _load_cached_report(session, user_id=uid, pack_key=pack_key, start=start, end=end, input_hash=prehash)
+            cached_text = await _load_cached_report(
+                session,
+                user_id=uid,
+                pack_key=pack_key,
+                start=start,
+                end=end,
+                input_hash=prehash,
+            )
             if cached_text:
                 log.info("stage2 cache hit: input_hash=%s", prehash)
                 return ReportResult(pack_id, pack_key, pack_title, start, end, cached_text, ordered, prehash, AI_STAGE2_MODEL)
@@ -402,5 +429,5 @@ async def generate_report(pack_key: str, hours: int = 24, limit: int = 120, *, u
 
         res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, ordered, ih, AI_STAGE2_MODEL)
         if save and uid is not None:
-            await _save_report(session, user_id=uid, res=res, prompt_text=prompt_text)
+            await _save_report(session, user_id=uid, res=res)
         return res
