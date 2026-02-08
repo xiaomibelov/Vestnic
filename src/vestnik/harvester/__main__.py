@@ -243,6 +243,7 @@ async def _harvest_one_channel(client: TelegramClient, ch: Channel) -> tuple[int
             {
                 "channel_ref": channel_ref,
                 "message_id": str(msg.id),
+                "url": f"https://t.me/{channel_ref}/{msg.id}",
                 "text": text,
                 "published_at": getattr(msg, "date", None) or now,
                 "fetched_at": now,

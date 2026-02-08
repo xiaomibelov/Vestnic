@@ -188,6 +188,8 @@ async def digest(m: Message):
             )
         ).scalars().all()
 
+        channel_usernames = [u.lstrip('@') for u in channel_usernames]
+
         if not channel_usernames:
             await m.answer("Для выбранных паков нет активных каналов.")
             return
@@ -217,7 +219,7 @@ async def digest(m: Message):
         chunk = f"{p.channel_ref}: {text}\n{p.url}\n\n"
         if len(out) + len(chunk) > 3800:
             break
-        out += chunk
+        out += chunkhunk
 
     await m.answer(out.strip())
 
