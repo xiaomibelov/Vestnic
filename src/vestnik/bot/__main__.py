@@ -9,7 +9,22 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from sqlalchemy import select
 
 from vestnik.db import session_scope
-from vestnik.models import Channel, Pack, PackChannel, PostCache, User, UserPack
+import vestnik.models as models
+
+def _model_by_tablename(tablename: str):
+    for v in models.__dict__.values():
+        if getattr(v, "__tablename__", None) == tablename:
+            return v
+    available = sorted({getattr(v, "__tablename__", None) for v in models.__dict__.values() if getattr(v, "__tablename__", None)})
+    raise ImportError(f"Model for table {tablename!r} not found. Available tablenames: {available}")
+
+Channel = _model_by_tablename("channels")
+Pack = _model_by_tablename("packs")
+PackChannel = _model_by_tablename("pack_channels")
+PostCache = _model_by_tablename("posts_cache")
+User = _model_by_tablename("users")
+UserPack = _model_by_tablename("user_packs")
+
 from vestnik.settings import BOT_TOKEN
 
 logging.basicConfig(level=logging.INFO)
@@ -219,7 +234,7 @@ async def digest(m: Message):
         chunk = f"{p.channel_ref}: {text}\n{p.url}\n\n"
         if len(out) + len(chunk) > 3800:
             break
-        out += chunkhunk
+        out += chunkhunkhunk
 
     await m.answer(out.strip())
 
