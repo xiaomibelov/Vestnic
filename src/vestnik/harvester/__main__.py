@@ -1,4 +1,5 @@
 import asyncio
+import binascii
 import logging
 import random
 from datetime import datetime, timedelta, timezone
@@ -36,14 +37,54 @@ def _ttl_expires_at(now: datetime) -> datetime:
     return now + timedelta(hours=ttl)
 
 
+def _sanitize_tg_session(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return s
+
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        s = s[1:-1].strip()
+
+    s = "".join(s.split())
+
+    if "/" in s or s.endswith(".session"):
+        return s
+
+    if len(s) >= 2 and s[0].isdigit():
+        ver = s[0]
+        payload = s[1:]
+        pad = (-len(payload)) % 4
+        if pad:
+            payload = payload + ("=" * pad)
+        return ver + payload
+
+    pad = (-len(s)) % 4
+    if pad:
+        s = s + ("=" * pad)
+    return s
+
+
 def _make_client() -> TelegramClient | None:
     if not TG_API_ID or not TG_API_HASH:
         return None
-    if TG_SESSION:
-        if "/" in TG_SESSION or TG_SESSION.endswith(".session"):
-            return TelegramClient(TG_SESSION, TG_API_ID, TG_API_HASH)
-        return TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
-    return None
+    if not TG_SESSION:
+        return None
+
+    sess = _sanitize_tg_session(TG_SESSION)
+    if not sess:
+        return None
+
+    if "/" in sess or sess.endswith(".session"):
+        return TelegramClient(sess, TG_API_ID, TG_API_HASH)
+
+    try:
+        return TelegramClient(StringSession(sess), TG_API_ID, TG_API_HASH)
+    except (binascii.Error, ValueError) as e:
+        logger.error(
+            "invalid TG_SESSION (%s). Re-generate via `python -m vestnik.harvester login` and set TG_SESSION='...' in .env",
+            e,
+        )
+        return None
 
 
 async def _fetch_active_channels() -> list[Channel]:
@@ -94,13 +135,22 @@ async def _maybe_update_channel_meta(channel_id: int, tg_channel_id: int | None,
         ch = (await session.execute(select(Channel).where(Channel.id == channel_id))).scalars().first()
         if not ch:
             return
+
         changed = False
-        if tg_channel_id and not ch.tg_channel_id:
-            ch.tg_channel_id = tg_channel_id
-            changed = True
-        if title and (not ch.title or ch.title.strip() == "" or ch.title == ch.username):
-            ch.title = title
-            changed = True
+
+        # IMPORTANT: model may not have these fields yet; guard by hasattr.
+        if tg_channel_id is not None and hasattr(ch, "tg_channel_id"):
+            cur = getattr(ch, "tg_channel_id", None)
+            if not cur:
+                setattr(ch, "tg_channel_id", tg_channel_id)
+                changed = True
+
+        if title and hasattr(ch, "title"):
+            cur_title = (getattr(ch, "title", None) or "").strip()
+            if not cur_title or cur_title == getattr(ch, "username", ""):
+                setattr(ch, "title", title)
+                changed = True
+
         if changed:
             await session.commit()
 
@@ -108,43 +158,48 @@ async def _maybe_update_channel_meta(channel_id: int, tg_channel_id: int | None,
 async def _harvest_one_channel(client: TelegramClient, ch: Channel) -> int:
     channel_ref = ch.username.lstrip("@")
     last_id = await _last_message_id(channel_ref)
+
     entity = await client.get_entity(channel_ref)
+
+    # Safe meta update (no-op if model doesn't support those columns)
     await _maybe_update_channel_meta(ch.id, getattr(entity, "id", None), getattr(entity, "title", None))
 
     now = _now_utc()
     expires_at = _ttl_expires_at(now)
 
+    limit = HARVEST_LIMIT_PER_CHANNEL
+    if not isinstance(limit, int) or limit <= 0:
+        limit = 50
+
     collected: list[dict] = []
-    async for msg in client.iter_messages(entity, min_id=last_id, limit=HARVEST_LIMIT_PER_CHANNEL, reverse=True):
+    async for msg in client.iter_messages(entity, min_id=last_id, limit=limit, reverse=True):
         if not msg:
             continue
-        text = (msg.message or "").strip()
+        if not getattr(msg, "id", None):
+            continue
+
+        text = (getattr(msg, "raw_text", None) or getattr(msg, "message", None) or "").strip()
         if not text:
             continue
-        url = f"https://t.me/{channel_ref}/{msg.id}" if channel_ref else ""
+
         collected.append(
             {
                 "channel_ref": channel_ref,
                 "message_id": str(msg.id),
-                "url": url,
                 "text": text,
+                "published_at": getattr(msg, "date", None) or now,
+                "fetched_at": now,
                 "expires_at": expires_at,
+                "is_deleted": False,
             }
         )
 
-    inserted = await _upsert_posts(channel_ref, collected)
-    return inserted
+    return await _upsert_posts(channel_ref, collected)
 
 
 async def _run_loop() -> None:
-    logger.info(
-        "harvester loop starting enabled=%s interval=%s limit=%s ttl_h=%s",
-        HARVESTER_ENABLED,
-        HARVEST_INTERVAL_SEC,
-        HARVEST_LIMIT_PER_CHANNEL,
-        POST_CACHE_TTL_HOURS,
-    )
-
+    if not HARVESTER_ENABLED:
+        logger.warning("HARVESTER_ENABLED=0; harvester is idle")
     while True:
         if not HARVESTER_ENABLED:
             await asyncio.sleep(5)
@@ -152,7 +207,7 @@ async def _run_loop() -> None:
 
         client = _make_client()
         if client is None:
-            logger.warning("harvester disabled by config: TG_API_ID/TG_API_HASH/TG_SESSION not set")
+            logger.warning("harvester disabled by config: TG_API_ID/TG_API_HASH/TG_SESSION not set or invalid")
             await asyncio.sleep(10)
             continue
 
@@ -160,7 +215,7 @@ async def _run_loop() -> None:
             async with client:
                 channels = await _fetch_active_channels()
                 if not channels:
-                    await asyncio.sleep(max(5, HARVEST_INTERVAL_SEC))
+                    await asyncio.sleep(max(5, HARVEST_INTERVAL_SEC if isinstance(HARVEST_INTERVAL_SEC, int) else 60))
                     continue
 
                 cleaned = await _cleanup_expired()
@@ -190,7 +245,7 @@ async def _run_loop() -> None:
         except Exception as e:
             logger.exception("harvester cycle error err=%s", e)
 
-        sleep_s = HARVEST_INTERVAL_SEC
+        sleep_s = HARVEST_INTERVAL_SEC if isinstance(HARVEST_INTERVAL_SEC, int) else 60
         if sleep_s <= 0:
             sleep_s = 60
         await asyncio.sleep(sleep_s)
@@ -211,59 +266,12 @@ async def _cmd_login() -> None:
     print("")
 
 
-async def _cmd_login_qr() -> None:
-    if not TG_API_ID or not TG_API_HASH:
-        raise SystemExit("TG_API_ID/TG_API_HASH are required for login. Put them into .env")
-    logger.info("starting telegram login (qr)")
-    client = TelegramClient(StringSession(), TG_API_ID, TG_API_HASH)
-    await client.connect()
-    try:
-        qr = await client.qr_login()
-        url = getattr(qr, "url", "") or ""
-        if not url:
-            raise RuntimeError("qr login did not return a login url")
-
-        https_url = url
-        if url.startswith("tg://login?token="):
-            https_url = "https://t.me/login?token=" + url.split("token=", 1)[1]
-
-        print("")
-        print("Approve login on your phone (same Telegram account).")
-        print("Option A: open this link on the phone (it will open Telegram):")
-        print(url)
-        if https_url != url:
-            print("")
-            print("Option B (if tg:// link is not clickable):")
-            print(https_url)
-        print("")
-        print("Waiting for approval... (180s)")
-        try:
-            await qr.wait(timeout=180)
-        except asyncio.TimeoutError:
-            print("")
-            print("Timed out waiting for approval.")
-            print("Run the command again to get a fresh link.")
-            raise SystemExit(2)
-
-        session_str = client.session.save()
-    finally:
-        await client.disconnect()
-
-    print("")
-    print("Put this into .env")
-    print(f"TG_SESSION={session_str}")
-    print("HARVESTER_ENABLED=1")
-    print("")
-
-
 def main() -> None:
     import sys
+
     cmd = (sys.argv[1] if len(sys.argv) > 1 else "").strip().lower()
     if cmd in {"login", "auth"}:
         asyncio.run(_cmd_login())
-        return
-    if cmd in {"login-qr", "auth-qr", "qr"}:
-        asyncio.run(_cmd_login_qr())
         return
     asyncio.run(_run_loop())
 
