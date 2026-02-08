@@ -306,11 +306,22 @@ def _build_message(posts: list[PostRow], mode: str, max_chars: int = 3800) -> st
     return out.strip()
 
 
+def _dry_preview_lines(posts: list[PostRow], n: int) -> str:
+    if n <= 0:
+        return ""
+    lines: list[str] = []
+    for p in posts[:n]:
+        url = (p.url or "").strip() or f"https://t.me/{p.channel_ref}/{p.message_id}"
+        lines.append(f"@{p.channel_ref}/{p.message_id} {url}")
+    return " | ".join(lines)
+
+
 async def _oneshot() -> None:
     enabled = _env_bool("WORKER_ENABLED", True)
     dry = _env_bool("WORKER_DRY_RUN", False)
     max_posts = _env_int("WORKER_MAX_POSTS_PER_USER", 10)
     target_tg = os.environ.get("WORKER_TARGET_TG_ID", "").strip()
+    preview_n = _env_int("WORKER_DRY_RUN_PREVIEW_N", 0)
 
     if not enabled:
         logger.warning("WORKER_ENABLED=0; idle")
@@ -334,7 +345,7 @@ async def _oneshot() -> None:
             except Exception:
                 logger.warning("WORKER_TARGET_TG_ID invalid: %s", target_tg)
 
-        logger.info("oneshot: users=%s dry_run=%s max_posts=%s", len(users), dry, max_posts)
+        logger.info("oneshot: users=%s dry_run=%s max_posts=%s preview_n=%s", len(users), dry, max_posts, preview_n)
 
         sent_users = 0
         for u in users:
@@ -369,11 +380,14 @@ async def _oneshot() -> None:
                 if not posts:
                     continue
 
-                msg = _build_message(posts, format_mode)
-
                 if dry:
+                    preview = _dry_preview_lines(posts, preview_n)
+                    if preview:
+                        logger.info("DRY preview user_tg=%s sample=%s", u.tg_id, preview)
                     logger.info("DRY (no side effects) user_tg=%s would_send=%s", u.tg_id, len(posts))
                     continue
+
+                msg = _build_message(posts, format_mode)
 
                 await bot.send_message(u.tg_id, msg)
                 await _mark_delivered(session, u.id, posts)
