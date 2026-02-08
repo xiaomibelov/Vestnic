@@ -25,9 +25,19 @@ from vestnik.settings import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vestnik.harvester")
 
+_POSTCACHE_COLS: set[str] | None = None
+
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _postcache_cols() -> set[str]:
+    global _POSTCACHE_COLS
+    if _POSTCACHE_COLS is None:
+        _POSTCACHE_COLS = set(PostCache.__table__.columns.keys())
+        logger.info("posts_cache columns=%s", ",".join(sorted(_POSTCACHE_COLS)))
+    return _POSTCACHE_COLS
 
 
 def _ttl_expires_at(now: datetime) -> datetime:
@@ -116,12 +126,55 @@ async def _cleanup_expired() -> int:
             return 0
 
 
+def _project_postcache_row(raw: dict) -> dict:
+    cols = _postcache_cols()
+    out: dict = {}
+
+    for k in ("channel_ref", "message_id", "text", "is_deleted"):
+        if k in cols and k in raw:
+            out[k] = raw[k]
+
+    pub = raw.get("published_at")
+    if pub is not None:
+        for k in ("published_at", "posted_at", "message_date", "date"):
+            if k in cols and k not in out:
+                out[k] = pub
+                break
+
+    fetched = raw.get("fetched_at") or _now_utc()
+    for k in ("fetched_at", "created_at", "ingested_at", "inserted_at"):
+        if k in cols and k not in out:
+            out[k] = fetched
+            break
+
+    exp = raw.get("expires_at")
+    if exp is not None:
+        for k in ("expires_at", "expire_at", "expires"):
+            if k in cols and k not in out:
+                out[k] = exp
+                break
+
+    return out
+
+
 async def _upsert_posts(channel_ref: str, rows: list[dict]) -> int:
     if not rows:
         return 0
+
+    projected = [_project_postcache_row(r) for r in rows]
+    projected = [r for r in projected if r]
+
+    if not projected:
+        logger.warning("no insertable columns for posts_cache; rows dropped")
+        return 0
+
+    cols = _postcache_cols()
+    conflict_cols = [c for c in ("channel_ref", "message_id") if c in cols]
+
     async with session_scope() as session:
-        stmt = insert(PostCache).values(rows)
-        stmt = stmt.on_conflict_do_nothing(index_elements=["channel_ref", "message_id"])
+        stmt = insert(PostCache).values(projected)
+        if len(conflict_cols) == 2:
+            stmt = stmt.on_conflict_do_nothing(index_elements=conflict_cols)
         res = await session.execute(stmt)
         await session.commit()
         try:
@@ -177,7 +230,6 @@ async def _harvest_one_channel(client: TelegramClient, ch: Channel) -> tuple[int
     if last_id > 0:
         kwargs["min_id"] = last_id
 
-    # Берём последние сообщения (без reverse=True) — быстро и предсказуемо для первичного сидинга.
     async for msg in client.iter_messages(entity, **kwargs):
         scanned += 1
         if not msg or not getattr(msg, "id", None):
