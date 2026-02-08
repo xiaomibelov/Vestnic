@@ -372,10 +372,7 @@ async def _oneshot() -> None:
                 msg = _build_message(posts, format_mode)
 
                 if dry:
-                    logger.info("DRY user_tg=%s posts=%s", u.tg_id, len(posts))
-                    await _mark_delivered(session, u.id, posts)
-                    await _touch_last_sent(session, u.id)
-                    sent_users += 1
+                    logger.info("DRY (no side effects) user_tg=%s would_send=%s", u.tg_id, len(posts))
                     continue
 
                 await bot.send_message(u.tg_id, msg)
