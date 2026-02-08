@@ -1,10 +1,12 @@
 import os
 
+
 def env(name: str, default: str | None = None) -> str | None:
     val = os.getenv(name)
     if val is None or val == "":
         return default
     return val
+
 
 def env_int(name: str, default: int = 0) -> int:
     raw = env(name, None)
@@ -15,11 +17,13 @@ def env_int(name: str, default: int = 0) -> int:
     except Exception:
         return default
 
+
 def env_bool(name: str, default: bool = False) -> bool:
     raw = env(name, None)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
 
 BOT_TOKEN = env("BOT_TOKEN", "")
 DATABASE_URL = env("DATABASE_URL", "postgresql+asyncpg://vestnik:vestnik@db:5432/vestnik")
@@ -34,3 +38,10 @@ HARVESTER_ENABLED = env_bool("HARVESTER_ENABLED", False)
 HARVEST_INTERVAL_SEC = env_int("HARVEST_INTERVAL_SEC", 60)
 HARVEST_LIMIT_PER_CHANNEL = env_int("HARVEST_LIMIT_PER_CHANNEL", 50)
 POST_CACHE_TTL_HOURS = env_int("POST_CACHE_TTL_HOURS", 48)
+
+AI_ENABLED = env_bool("AI_ENABLED", True)
+OPENAI_API_KEY = env("OPENAI_API_KEY", "") or ""
+OPENAI_BASE_URL = env("OPENAI_BASE_URL", "https://api.openai.com/v1") or "https://api.openai.com/v1"
+AI_STAGE1_MODEL = env("AI_STAGE1_MODEL", "gpt-4o-mini") or "gpt-4o-mini"
+AI_STAGE2_MODEL = env("AI_STAGE2_MODEL", "gpt-4o") or "gpt-4o"
+AI_HTTP_TIMEOUT_SEC = env_int("AI_HTTP_TIMEOUT_SEC", 60)

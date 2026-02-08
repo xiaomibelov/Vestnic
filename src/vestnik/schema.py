@@ -282,4 +282,26 @@ async def ensure_schema(session: AsyncSession) -> None:
     await session.execute(text("create index if not exists ix_payments_log_user_id on payments_log(user_id);"))
     await session.execute(text("create index if not exists ix_payments_log_created_at on payments_log(created_at);"))
 
+
+    # reports (готовые отчёты; расширение ER-модели, поля не удаляем)
+    await session.execute(
+        text(
+            """
+            create table if not exists reports (
+              id serial primary key,
+              user_id integer not null,
+              pack_id integer null,
+              pack_key varchar(64) null,
+              period_start timestamptz not null,
+              period_end timestamptz not null,
+              sources_json text not null default '',
+              report_text text not null default '',
+              created_at timestamptz not null default now()
+            );
+            """
+        )
+    )
+    await session.execute(text("create index if not exists ix_reports_user_id on reports(user_id);"))
+    await session.execute(text("create index if not exists ix_reports_created_at on reports(created_at);"))
+
     await session.commit()
