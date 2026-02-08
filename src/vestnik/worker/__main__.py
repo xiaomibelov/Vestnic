@@ -109,12 +109,15 @@ async def _ensure_user_settings(session) -> None:
               delivery_enabled boolean not null default true,
               digest_interval_sec integer null,
               last_sent_at timestamptz null,
-              pause_until timestamptz null
+              pause_until timestamptz null,
+              format_mode varchar(16) not null default 'digest'
             );
             """
         )
     )
     await session.execute(text("alter table user_settings add column if not exists pause_until timestamptz;"))
+    await session.execute(text("alter table user_settings add column if not exists format_mode varchar(16);"))
+    await session.execute(text("update user_settings set format_mode='digest' where format_mode is null;"))
     await session.execute(text("create index if not exists ix_user_settings_delivery_enabled on user_settings(delivery_enabled);"))
     await session.execute(text("create index if not exists ix_user_settings_pause_until on user_settings(pause_until);"))
     await session.commit()
@@ -128,18 +131,18 @@ async def _ensure_user_settings_row(session, user_id: int) -> None:
     await session.commit()
 
 
-async def _get_user_settings(session, user_id: int) -> tuple[bool, int | None, datetime | None, datetime | None]:
+async def _get_user_settings(session, user_id: int) -> tuple[bool, int | None, datetime | None, datetime | None, str]:
     await _ensure_user_settings(session)
     await _ensure_user_settings_row(session, user_id)
     row = (
         await session.execute(
-            text("select delivery_enabled, digest_interval_sec, last_sent_at, pause_until from user_settings where user_id=:uid"),
+            text("select delivery_enabled, digest_interval_sec, last_sent_at, pause_until, format_mode from user_settings where user_id=:uid"),
             {"uid": user_id},
         )
     ).first()
     if not row:
-        return True, None, None, None
-    return bool(row[0]), (int(row[1]) if row[1] is not None else None), row[2], row[3]
+        return True, None, None, None, "digest"
+    return bool(row[0]), (int(row[1]) if row[1] is not None else None), row[2], row[3], (str(row[4]) if row[4] else "digest")
 
 
 @dataclass(frozen=True)
@@ -275,7 +278,21 @@ async def _touch_last_sent(session, user_id: int) -> None:
     await session.commit()
 
 
-def _build_digest(posts: list[PostRow], max_chars: int = 3800) -> str:
+def _build_message(posts: list[PostRow], mode: str, max_chars: int = 3800) -> str:
+    mode = (mode or "digest").strip().lower()
+    if mode == "compact":
+        out = "Лента (компакт):\n\n"
+        for p in posts:
+            t = (p.text or "").strip().replace("\n", " ")
+            if len(t) > 120:
+                t = t[:120] + "…"
+            url = (p.url or "").strip() or f"https://t.me/{p.channel_ref}/{p.message_id}"
+            chunk = f"• @{p.channel_ref}: {t}\n{url}\n\n"
+            if len(out) + len(chunk) > max_chars:
+                break
+            out += chunk
+        return out.strip()
+
     out = "Авто-дайджест:\n\n"
     for p in posts:
         t = (p.text or "").strip().replace("\n", " ")
@@ -322,7 +339,7 @@ async def _oneshot() -> None:
         sent_users = 0
         for u in users:
             try:
-                delivery_enabled, interval_sec, last_sent_at, pause_until = await _get_user_settings(session, u.id)
+                delivery_enabled, interval_sec, last_sent_at, pause_until, format_mode = await _get_user_settings(session, u.id)
                 if not delivery_enabled:
                     continue
 
@@ -352,7 +369,7 @@ async def _oneshot() -> None:
                 if not posts:
                     continue
 
-                msg = _build_digest(posts)
+                msg = _build_message(posts, format_mode)
 
                 if dry:
                     logger.info("DRY user_tg=%s posts=%s", u.tg_id, len(posts))

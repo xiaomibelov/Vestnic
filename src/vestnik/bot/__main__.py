@@ -26,6 +26,15 @@ class PackRow:
     title: str
 
 
+@dataclass(frozen=True)
+class PostRow:
+    channel_ref: str
+    message_id: str
+    text: str
+    url: str
+    parsed_at: datetime | None
+
+
 def _safe_ident(name: str) -> str:
     if not re.fullmatch(r"[a-zA-Z0-9_]+", name or ""):
         raise ValueError(f"unsafe identifier: {name!r}")
@@ -70,6 +79,25 @@ async def _resolve_pack_tables(session) -> tuple[str, str, str]:
     return packs_t, user_packs_t, pack_channels_t
 
 
+async def _ensure_deliveries_table(session) -> None:
+    await session.execute(
+        text(
+            """
+            create table if not exists deliveries (
+              id serial primary key,
+              user_id integer not null,
+              channel_ref varchar(255) not null,
+              message_id varchar(64) not null,
+              sent_at timestamptz not null default now(),
+              unique (user_id, channel_ref, message_id)
+            );
+            """
+        )
+    )
+    await session.execute(text("create index if not exists ix_deliveries_user_id on deliveries(user_id);"))
+    await session.commit()
+
+
 async def _ensure_user_settings(session) -> None:
     await session.execute(
         text(
@@ -81,7 +109,8 @@ async def _ensure_user_settings(session) -> None:
               last_sent_at timestamptz null,
               menu_chat_id bigint null,
               menu_message_id integer null,
-              pause_until timestamptz null
+              pause_until timestamptz null,
+              format_mode varchar(16) not null default 'digest'
             );
             """
         )
@@ -89,6 +118,8 @@ async def _ensure_user_settings(session) -> None:
     await session.execute(text("alter table user_settings add column if not exists menu_chat_id bigint;"))
     await session.execute(text("alter table user_settings add column if not exists menu_message_id integer;"))
     await session.execute(text("alter table user_settings add column if not exists pause_until timestamptz;"))
+    await session.execute(text("alter table user_settings add column if not exists format_mode varchar(16);"))
+    await session.execute(text("update user_settings set format_mode='digest' where format_mode is null;"))
     await session.execute(text("create index if not exists ix_user_settings_delivery_enabled on user_settings(delivery_enabled);"))
     await session.execute(text("create index if not exists ix_user_settings_pause_until on user_settings(pause_until);"))
     await session.commit()
@@ -109,7 +140,7 @@ async def _get_user_settings(session, user_id: int) -> dict:
         await session.execute(
             text(
                 """
-                select delivery_enabled, digest_interval_sec, last_sent_at, menu_chat_id, menu_message_id, pause_until
+                select delivery_enabled, digest_interval_sec, last_sent_at, menu_chat_id, menu_message_id, pause_until, format_mode
                 from user_settings where user_id=:uid
                 """
             ),
@@ -124,6 +155,7 @@ async def _get_user_settings(session, user_id: int) -> dict:
             "menu_chat_id": None,
             "menu_message_id": None,
             "pause_until": None,
+            "format_mode": "digest",
         }
     return {
         "delivery_enabled": bool(row[0]),
@@ -132,6 +164,7 @@ async def _get_user_settings(session, user_id: int) -> dict:
         "menu_chat_id": row[3],
         "menu_message_id": row[4],
         "pause_until": row[5],
+        "format_mode": (str(row[6]) if row[6] else "digest"),
     }
 
 
@@ -154,6 +187,18 @@ async def _toggle_delivery(session, user_id: int) -> bool:
     )
     await session.commit()
     return new_val
+
+
+async def _toggle_format_mode(session, user_id: int) -> str:
+    cur = await _get_user_settings(session, user_id)
+    mode = (cur.get("format_mode") or "digest").strip().lower()
+    new_mode = "compact" if mode != "compact" else "digest"
+    await session.execute(
+        text("update user_settings set format_mode=:m where user_id=:uid"),
+        {"m": new_mode, "uid": user_id},
+    )
+    await session.commit()
+    return new_mode
 
 
 async def _set_interval_minutes(session, user_id: int, minutes: int | None) -> None:
@@ -186,14 +231,17 @@ async def _pause_clear(session, user_id: int) -> None:
 
 
 async def _reset_deliveries_for_user(session, user_id: int) -> int:
-    # deliveries must exist already in your schema; but guard anyway
-    tables = await _list_tables(session)
-    if "deliveries" not in tables:
-        return 0
+    await _ensure_deliveries_table(session)
     res = await session.execute(text("delete from deliveries where user_id=:uid"), {"uid": user_id})
     await session.commit()
-    # rowcount may be None depending on driver; return 0/1 safe
     return int(res.rowcount or 0)
+
+
+async def _touch_last_sent(session, user_id: int) -> None:
+    await _ensure_user_settings(session)
+    await _ensure_user_settings_row(session, user_id)
+    await session.execute(text("update user_settings set last_sent_at=now() where user_id=:uid"), {"uid": user_id})
+    await session.commit()
 
 
 def _fmt_settings(s: dict) -> str:
@@ -204,6 +252,8 @@ def _fmt_settings(s: dict) -> str:
         iv = f"{mins} мин"
     else:
         iv = "глобальная (env)"
+
+    mode = "компакт" if (s.get("format_mode") == "compact") else "дайджест"
 
     last = s["last_sent_at"].isoformat() if s["last_sent_at"] else "-"
 
@@ -221,14 +271,15 @@ def _fmt_settings(s: dict) -> str:
     else:
         pause = "нет"
 
-    return f"Рассылка: {st}\nИнтервал: {iv}\nПауза: {pause}\nПоследняя отправка: {last}"
+    return f"Рассылка: {st}\nИнтервал: {iv}\nФормат: {mode}\nПауза: {pause}\nПоследняя отправка: {last}"
 
 
 def _kb_menu() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="📦 Паки", callback_data="scr:packs:0")],
+        [InlineKeyboardButton(text="🚀 Отправить сейчас", callback_data="scr:send")],
+        [InlineKeyboardButton(text="🧾 Очередь", callback_data="scr:queue")],
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="scr:settings")],
-        [InlineKeyboardButton(text="📰 Дайджест сейчас", callback_data="act:digest_now")],
         [InlineKeyboardButton(text="📡 Каналы", callback_data="scr:channels")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="scr:stats")],
         [InlineKeyboardButton(text="ℹ️ Помощь", callback_data="scr:help")],
@@ -242,6 +293,7 @@ def _kb_back(to: str = "menu") -> InlineKeyboardMarkup:
 
 def _kb_settings(s: dict) -> InlineKeyboardMarkup:
     toggle_txt = "Отключить рассылку" if s["delivery_enabled"] else "Включить рассылку"
+
     paused = False
     pu = s.get("pause_until")
     if pu:
@@ -253,10 +305,12 @@ def _kb_settings(s: dict) -> InlineKeyboardMarkup:
             paused = False
 
     pause_txt = "▶️ Возобновить" if paused else "⏸ Пауза 1 час"
+    mode_txt = "Формат: компакт" if (s.get("format_mode") == "compact") else "Формат: дайджест"
 
     rows = [
         [InlineKeyboardButton(text=toggle_txt, callback_data="act:delivery_toggle:settings")],
         [InlineKeyboardButton(text=pause_txt, callback_data="act:pause_toggle:settings")],
+        [InlineKeyboardButton(text=mode_txt, callback_data="act:mode_toggle:settings")],
         [
             InlineKeyboardButton(text="⏱ 5м", callback_data="act:iv:5:settings"),
             InlineKeyboardButton(text="⏱ 15м", callback_data="act:iv:15:settings"),
@@ -273,6 +327,21 @@ def _kb_reset_confirm() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="✅ Да, сбросить", callback_data="act:reset_deliveries")],
         [InlineKeyboardButton(text="⬅️ Отмена", callback_data="scr:settings")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _kb_send(s: dict) -> InlineKeyboardMarkup:
+    mode_txt = "Формат: компакт" if (s.get("format_mode") == "compact") else "Формат: дайджест"
+    rows = [
+        [InlineKeyboardButton(text=mode_txt, callback_data="act:mode_toggle:send")],
+        [
+            InlineKeyboardButton(text="1", callback_data="act:send:1"),
+            InlineKeyboardButton(text="5", callback_data="act:send:5"),
+            InlineKeyboardButton(text="10", callback_data="act:send:10"),
+            InlineKeyboardButton(text="25", callback_data="act:send:25"),
+        ],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="scr:menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -450,6 +519,81 @@ async def _channels_for_pack_ids(session, pack_ids: list[int]) -> list[str]:
     return [u.lstrip("@") for u in usernames]
 
 
+async def _fetch_unsent_posts(session, user_id: int, channel_refs: list[str], limit: int) -> list[PostRow]:
+    if not channel_refs:
+        return []
+    await _ensure_deliveries_table(session)
+    now = datetime.now(timezone.utc)
+
+    sql = text(
+        """
+        select p.channel_ref, p.message_id, p.text, p.url, p.parsed_at
+        from posts_cache p
+        left join deliveries d
+          on d.user_id = :uid
+         and d.channel_ref = p.channel_ref
+         and d.message_id = p.message_id
+        where d.id is null
+          and p.is_deleted = false
+          and p.expires_at > :now
+          and p.channel_ref = any(:refs)
+        order by p.parsed_at desc
+        limit :lim
+        """
+    )
+    res = await session.execute(sql, {"uid": user_id, "now": now, "refs": channel_refs, "lim": limit})
+    out: list[PostRow] = []
+    for r in res.all():
+        out.append(PostRow(channel_ref=str(r[0]), message_id=str(r[1]), text=str(r[2] or ""), url=str(r[3] or ""), parsed_at=r[4]))
+    return out
+
+
+async def _mark_delivered(session, user_id: int, posts: list[PostRow]) -> None:
+    if not posts:
+        return
+    await _ensure_deliveries_table(session)
+    rows = [{"uid": user_id, "cr": p.channel_ref, "mid": p.message_id} for p in posts]
+    await session.execute(
+        text(
+            """
+            insert into deliveries (user_id, channel_ref, message_id)
+            values (:uid, :cr, :mid)
+            on conflict do nothing
+            """
+        ),
+        rows,
+    )
+    await session.commit()
+
+
+def _build_message(posts: list[PostRow], mode: str) -> str:
+    mode = (mode or "digest").strip().lower()
+    if mode == "compact":
+        out = "Лента (компакт):\n\n"
+        for p in posts:
+            t = (p.text or "").strip().replace("\n", " ")
+            if len(t) > 120:
+                t = t[:120] + "…"
+            url = (p.url or "").strip() or f"https://t.me/{p.channel_ref}/{p.message_id}"
+            line = f"• @{p.channel_ref}: {t}\n{url}\n\n"
+            if len(out) + len(line) > 3800:
+                break
+            out += line
+        return out.strip()
+
+    out = "Авто-дайджест:\n\n"
+    for p in posts:
+        t = (p.text or "").strip().replace("\n", " ")
+        if len(t) > 180:
+            t = t[:180] + "…"
+        url = (p.url or "").strip() or f"https://t.me/{p.channel_ref}/{p.message_id}"
+        chunk = f"@{p.channel_ref}: {t}\n{url}\n\n"
+        if len(out) + len(chunk) > 3800:
+            break
+        out += chunk
+    return out.strip()
+
+
 async def _render_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     async with session_scope() as session:
         s = await _get_user_settings(session, user_id)
@@ -460,13 +604,126 @@ async def _render_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 async def _render_settings(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     async with session_scope() as session:
         s = await _get_user_settings(session, user_id)
-    text0 = "⚙️ Настройки\n\n" + _fmt_settings(s) + "\n\nБыстрые действия:"
+    text0 = "⚙️ Настройки\n\n" + _fmt_settings(s)
     return text0, _kb_settings(s)
 
 
 async def _render_reset_confirm(_user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     text0 = "♻️ Сбросить доставку\n\nЭто удалит историю доставок *только для тебя*.\nПосле этого worker сможет прислать посты заново.\n\nПодтвердить?"
     return text0, _kb_reset_confirm()
+
+
+async def _render_send(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_scope() as session:
+        s = await _get_user_settings(session, user_id)
+        selected = await _selected_pack_ids(session, user_id)
+        refs: list[str] = []
+        if selected:
+            refs = await _channels_for_pack_ids(session, list(selected))
+        unsent = 0
+        if refs:
+            unsent = len(await _fetch_unsent_posts(session, user_id, refs, 9999))
+    text0 = "🚀 Отправить сейчас\n\n" + _fmt_settings(s) + f"\n\nВ очереди (тебе): {unsent}\n\nСколько постов отправить?"
+    return text0, _kb_send(s)
+
+
+async def _render_queue(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_scope() as session:
+        s = await _get_user_settings(session, user_id)
+        selected = await _selected_pack_ids(session, user_id)
+        if not selected:
+            return "🧾 Очередь\n\nПаки не выбраны. Сначала выбери /packs.", _kb_back("menu")
+
+        refs = await _channels_for_pack_ids(session, list(selected))
+        if not refs:
+            return "🧾 Очередь\n\nДля выбранных паков нет активных каналов.", _kb_back("menu")
+
+        await _ensure_deliveries_table(session)
+        now = datetime.now(timezone.utc)
+
+        total_unsent = (await session.execute(
+            text(
+                """
+                select count(*)
+                from posts_cache p
+                left join deliveries d
+                  on d.user_id = :uid
+                 and d.channel_ref = p.channel_ref
+                 and d.message_id = p.message_id
+                where d.id is null
+                  and p.is_deleted=false
+                  and p.expires_at > :now
+                  and p.channel_ref = any(:refs)
+                """
+            ),
+            {"uid": user_id, "now": now, "refs": refs},
+        )).scalar_one()
+
+        per = await session.execute(
+            text(
+                """
+                select p.channel_ref, count(*) as cnt
+                from posts_cache p
+                left join deliveries d
+                  on d.user_id = :uid
+                 and d.channel_ref = p.channel_ref
+                 and d.message_id = p.message_id
+                where d.id is null
+                  and p.is_deleted=false
+                  and p.expires_at > :now
+                  and p.channel_ref = any(:refs)
+                group by p.channel_ref
+                order by cnt desc, p.channel_ref asc
+                limit 12
+                """
+            ),
+            {"uid": user_id, "now": now, "refs": refs},
+        )
+        per_rows = per.all()
+
+        prev = await session.execute(
+            text(
+                """
+                select p.channel_ref, p.message_id, p.text, p.url, p.parsed_at
+                from posts_cache p
+                left join deliveries d
+                  on d.user_id = :uid
+                 and d.channel_ref = p.channel_ref
+                 and d.message_id = p.message_id
+                where d.id is null
+                  and p.is_deleted=false
+                  and p.expires_at > :now
+                  and p.channel_ref = any(:refs)
+                order by p.parsed_at desc
+                limit 5
+                """
+            ),
+            {"uid": user_id, "now": now, "refs": refs},
+        )
+        prev_rows = prev.all()
+
+    lines = ["🧾 Очередь", "", _fmt_settings(s), "", f"Всего не доставлено (тебе): {int(total_unsent)}", ""]
+    if per_rows:
+        lines.append("Топ каналов:")
+        for r in per_rows:
+            lines.append(f"@{r[0]} — {int(r[1])}")
+        lines.append("")
+
+    if prev_rows:
+        lines.append("Ближайшие посты:")
+        for r in prev_rows:
+            ch = str(r[0])
+            mid = str(r[1])
+            t = str(r[2] or "").strip().replace("\n", " ")
+            if len(t) > 90:
+                t = t[:90] + "…"
+            url = (str(r[3] or "").strip()) or f"https://t.me/{ch}/{mid}"
+            lines.append(f"• @{ch}: {t}")
+            lines.append(url)
+        lines.append("")
+
+    lines.append("Действия: 🚀 Отправить сейчас → в меню")
+    return "\n".join(lines).strip(), _kb_back("menu")
 
 
 async def _render_packs(user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -558,12 +815,14 @@ async def _render_help() -> tuple[str, InlineKeyboardMarkup]:
         "Команды:\n"
         "/menu — открыть меню\n"
         "/packs — паки\n"
-        "/settings — настройки\n"
-        "/digest — ручной дайджест\n\n"
+        "/settings — настройки\n\n"
+        "Экраны:\n"
+        "• 🚀 Отправить сейчас — ручная отправка N постов\n"
+        "• 🧾 Очередь — сколько осталось и превью\n\n"
         "Логика:\n"
         "• Harvester собирает посты в БД (posts_cache)\n"
-        "• Worker рассылает (deliveries — защита от дублей)\n"
-        "• Настройки/пауза — в user_settings\n"
+        "• Worker/бот отправляют и пишут deliveries (анти-дубли)\n"
+        "• Настройки/пауза/формат — в user_settings\n"
     )
     return text0, _kb_help()
 
@@ -575,6 +834,10 @@ async def _render_screen(user_id: int, screen: str, page: int = 0) -> tuple[str,
         return await _render_settings(user_id)
     if screen == "reset_confirm":
         return await _render_reset_confirm(user_id)
+    if screen == "send":
+        return await _render_send(user_id)
+    if screen == "queue":
+        return await _render_queue(user_id)
     if screen == "packs":
         return await _render_packs(user_id, page)
     if screen == "channels":
@@ -586,46 +849,41 @@ async def _render_screen(user_id: int, screen: str, page: int = 0) -> tuple[str,
     return await _render_menu(user_id)
 
 
-async def _manual_digest(user_id: int, msg_ctx: Message) -> None:
-    now = datetime.now(timezone.utc)
+async def _send_now(bot: Bot, user_id: int, tg_id: int, n: int) -> int:
+    n = max(min(int(n), 50), 1)
     async with session_scope() as session:
+        s = await _get_user_settings(session, user_id)
+
+        pu = s.get("pause_until")
+        if pu:
+            try:
+                if pu.tzinfo is None:
+                    pu = pu.replace(tzinfo=timezone.utc)
+                if pu > datetime.now(timezone.utc):
+                    return 0
+            except Exception:
+                pass
+
+        if not s.get("delivery_enabled", True):
+            return 0
+
         selected = await _selected_pack_ids(session, user_id)
         if not selected:
-            await msg_ctx.answer("Паки не выбраны. Открой /packs.")
-            return
+            return 0
         refs = await _channels_for_pack_ids(session, list(selected))
         if not refs:
-            await msg_ctx.answer("Для выбранных паков нет активных каналов.")
-            return
+            return 0
 
-        posts = (
-            await session.execute(
-                select(PostCache)
-                .where(
-                    PostCache.channel_ref.in_(list(refs)),
-                    PostCache.is_deleted == False,
-                    PostCache.expires_at > now,
-                )
-                .order_by(PostCache.parsed_at.desc())
-                .limit(15)
-            )
-        ).scalars().all()
+        posts = await _fetch_unsent_posts(session, user_id, refs, n)
+        if not posts:
+            return 0
 
-    if not posts:
-        await msg_ctx.answer("Нет свежих постов (harvester ещё не собрал новые данные).")
-        return
+        msg = _build_message(posts, s.get("format_mode") or "digest")
 
-    out = "📰 Дайджест (ручной):\n\n"
-    for p in posts:
-        text0 = (p.text or "").strip().replace("\n", " ")
-        if len(text0) > 180:
-            text0 = text0[:180] + "…"
-        url = (p.url or "").strip() or f"https://t.me/{p.channel_ref}/{p.message_id}"
-        chunk = f"@{p.channel_ref}: {text0}\n{url}\n\n"
-        if len(out) + len(chunk) > 3800:
-            break
-        out += chunk
-    await msg_ctx.answer(out.strip())
+        await bot.send_message(tg_id, msg)
+        await _mark_delivered(session, user_id, posts)
+        await _touch_last_sent(session, user_id)
+        return len(posts)
 
 
 async def _open_menu_message(bot: Bot, tg_id: int, chat_id: int, prefer_edit: bool = True) -> None:
@@ -672,12 +930,6 @@ async def settings_cmd(m: Message):
     user = await ensure_user(m.from_user.id)
     text0, kb = await _render_screen(user.id, "settings")
     await m.answer(text0, reply_markup=kb)
-
-
-@dp.message(Command("digest"))
-async def digest_cmd(m: Message):
-    user = await ensure_user(m.from_user.id)
-    await _manual_digest(user.id, m)
 
 
 @dp.callback_query(F.data == "noop")
@@ -744,8 +996,15 @@ async def action_router(cb: CallbackQuery):
         await cb.answer("OK")
         return
 
+    if act == "mode_toggle":
+        async with session_scope() as session:
+            await _toggle_format_mode(session, user.id)
+        text0, kb = await _render_screen(user.id, screen, page=page)
+        await _safe_edit_text(cb, text0, kb)
+        await cb.answer("OK")
+        return
+
     if act == "iv":
-        # act:iv:<minutes>:<screen>[:page]
         minutes = 0
         if len(parts) > 2:
             try:
@@ -775,20 +1034,12 @@ async def action_router(cb: CallbackQuery):
         return
 
     if act == "pk":
-        # act:pk:<pack_id>:<page>
         pack_id = int(parts[2])
         page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
         async with session_scope() as session:
             await _toggle_pack(session, user.id, pack_id)
         text0, kb = await _render_screen(user.id, "packs", page=page)
         await _safe_edit_text(cb, text0, kb)
-        await cb.answer("OK")
-        return
-
-    if act == "digest_now":
-        if cb.message:
-            await cb.message.answer("Собираю дайджест…")
-            await _manual_digest(user.id, cb.message)
         await cb.answer("OK")
         return
 
@@ -800,6 +1051,28 @@ async def action_router(cb: CallbackQuery):
         text0, kb = await _render_screen(user.id, "settings")
         await _safe_edit_text(cb, text0, kb)
         await cb.answer("OK")
+        return
+
+    if act == "send":
+        n = 5
+        if len(parts) > 2:
+            try:
+                n = int(parts[2])
+            except Exception:
+                n = 5
+        try:
+            sent = await _send_now(cb.bot, user.id, cb.from_user.id, n)
+            if sent <= 0:
+                await cb.answer("Нечего отправлять", show_alert=False)
+            else:
+                await cb.answer(f"Отправлено: {sent}", show_alert=False)
+        except Exception:
+            logger.exception("send_now error")
+            await cb.answer("Ошибка отправки", show_alert=True)
+
+        # refresh send screen
+        text0, kb = await _render_screen(user.id, "send")
+        await _safe_edit_text(cb, text0, kb)
         return
 
     await cb.answer("OK")
