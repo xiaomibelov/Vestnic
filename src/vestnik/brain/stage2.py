@@ -55,12 +55,12 @@ async def run_stage2(
     end: datetime,
     prompt_text: str,
     items: list[Stage1Item],
-) -> tuple[str, str]:
+    ) -> tuple[str, str]:
     if not (os.getenv("DEEPSEEK_API_KEY","") or os.getenv("OPENAI_API_KEY","")):
         raise RuntimeError("AI API key is empty (set DEEPSEEK_API_KEY or OPENAI_API_KEY)")
-cfg = OpenAIConfig(
-        api_key=OPENAI_API_KEY,
-        base_url=OPENAI_BASE_URL,
+    cfg = OpenAIConfig(
+        api_key=(os.getenv("DEEPSEEK_API_KEY","") or os.getenv("OPENAI_API_KEY","")),
+        base_url=(os.getenv("DEEPSEEK_BASE_URL","") or OPENAI_BASE_URL),
         max_retries=int(AI_MAX_RETRIES),
         retry_sleep_sec=int(AI_RETRY_SLEEP_SEC),
     )
