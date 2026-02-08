@@ -2,7 +2,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
@@ -30,12 +30,6 @@ def _safe_ident(name: str) -> str:
     if not re.fullmatch(r"[a-zA-Z0-9_]+", name or ""):
         raise ValueError(f"unsafe identifier: {name!r}")
     return name
-
-
-def _chunks(items: list, n: int) -> list[list]:
-    if n <= 0:
-        return [items]
-    return [items[i : i + n] for i in range(0, len(items), n)]
 
 
 async def _list_tables(session) -> set[str]:
@@ -86,26 +80,23 @@ async def _ensure_user_settings(session) -> None:
               digest_interval_sec integer null,
               last_sent_at timestamptz null,
               menu_chat_id bigint null,
-              menu_message_id integer null
+              menu_message_id integer null,
+              pause_until timestamptz null
             );
             """
         )
     )
     await session.execute(text("alter table user_settings add column if not exists menu_chat_id bigint;"))
     await session.execute(text("alter table user_settings add column if not exists menu_message_id integer;"))
+    await session.execute(text("alter table user_settings add column if not exists pause_until timestamptz;"))
     await session.execute(text("create index if not exists ix_user_settings_delivery_enabled on user_settings(delivery_enabled);"))
+    await session.execute(text("create index if not exists ix_user_settings_pause_until on user_settings(pause_until);"))
     await session.commit()
 
 
 async def _ensure_user_settings_row(session, user_id: int) -> None:
     await session.execute(
-        text(
-            """
-            insert into user_settings (user_id)
-            values (:uid)
-            on conflict do nothing
-            """
-        ),
+        text("insert into user_settings (user_id) values (:uid) on conflict do nothing"),
         {"uid": user_id},
     )
     await session.commit()
@@ -118,7 +109,7 @@ async def _get_user_settings(session, user_id: int) -> dict:
         await session.execute(
             text(
                 """
-                select delivery_enabled, digest_interval_sec, last_sent_at, menu_chat_id, menu_message_id
+                select delivery_enabled, digest_interval_sec, last_sent_at, menu_chat_id, menu_message_id, pause_until
                 from user_settings where user_id=:uid
                 """
             ),
@@ -126,14 +117,21 @@ async def _get_user_settings(session, user_id: int) -> dict:
         )
     ).first()
     if not row:
-        return {"delivery_enabled": True, "digest_interval_sec": None, "last_sent_at": None, "menu_chat_id": None, "menu_message_id": None}
-
+        return {
+            "delivery_enabled": True,
+            "digest_interval_sec": None,
+            "last_sent_at": None,
+            "menu_chat_id": None,
+            "menu_message_id": None,
+            "pause_until": None,
+        }
     return {
         "delivery_enabled": bool(row[0]),
         "digest_interval_sec": (int(row[1]) if row[1] is not None else None),
         "last_sent_at": row[2],
         "menu_chat_id": row[3],
         "menu_message_id": row[4],
+        "pause_until": row[5],
     }
 
 
@@ -172,15 +170,58 @@ async def _set_interval_minutes(session, user_id: int, minutes: int | None) -> N
     await session.commit()
 
 
+async def _pause_for_seconds(session, user_id: int, seconds: int) -> None:
+    until = datetime.now(timezone.utc) + timedelta(seconds=max(int(seconds), 60))
+    await _ensure_user_settings(session)
+    await _ensure_user_settings_row(session, user_id)
+    await session.execute(text("update user_settings set pause_until=:u where user_id=:uid"), {"u": until, "uid": user_id})
+    await session.commit()
+
+
+async def _pause_clear(session, user_id: int) -> None:
+    await _ensure_user_settings(session)
+    await _ensure_user_settings_row(session, user_id)
+    await session.execute(text("update user_settings set pause_until=null where user_id=:uid"), {"uid": user_id})
+    await session.commit()
+
+
+async def _reset_deliveries_for_user(session, user_id: int) -> int:
+    # deliveries must exist already in your schema; but guard anyway
+    tables = await _list_tables(session)
+    if "deliveries" not in tables:
+        return 0
+    res = await session.execute(text("delete from deliveries where user_id=:uid"), {"uid": user_id})
+    await session.commit()
+    # rowcount may be None depending on driver; return 0/1 safe
+    return int(res.rowcount or 0)
+
+
 def _fmt_settings(s: dict) -> str:
     st = "ВКЛ ✅" if s["delivery_enabled"] else "ВЫКЛ ⛔️"
+
     if s["digest_interval_sec"]:
         mins = max(int(s["digest_interval_sec"] // 60), 1)
         iv = f"{mins} мин"
     else:
         iv = "глобальная (env)"
+
     last = s["last_sent_at"].isoformat() if s["last_sent_at"] else "-"
-    return f"Рассылка: {st}\nИнтервал: {iv}\nПоследняя отправка: {last}"
+
+    pause_until = s.get("pause_until")
+    if pause_until:
+        try:
+            if pause_until.tzinfo is None:
+                pause_until = pause_until.replace(tzinfo=timezone.utc)
+            if pause_until > datetime.now(timezone.utc):
+                pause = f"до {pause_until.isoformat(timespec='seconds')}"
+            else:
+                pause = "нет"
+        except Exception:
+            pause = "нет"
+    else:
+        pause = "нет"
+
+    return f"Рассылка: {st}\nИнтервал: {iv}\nПауза: {pause}\nПоследняя отправка: {last}"
 
 
 def _kb_menu() -> InlineKeyboardMarkup:
@@ -201,15 +242,37 @@ def _kb_back(to: str = "menu") -> InlineKeyboardMarkup:
 
 def _kb_settings(s: dict) -> InlineKeyboardMarkup:
     toggle_txt = "Отключить рассылку" if s["delivery_enabled"] else "Включить рассылку"
+    paused = False
+    pu = s.get("pause_until")
+    if pu:
+        try:
+            if pu.tzinfo is None:
+                pu = pu.replace(tzinfo=timezone.utc)
+            paused = pu > datetime.now(timezone.utc)
+        except Exception:
+            paused = False
+
+    pause_txt = "▶️ Возобновить" if paused else "⏸ Пауза 1 час"
+
     rows = [
         [InlineKeyboardButton(text=toggle_txt, callback_data="act:delivery_toggle:settings")],
+        [InlineKeyboardButton(text=pause_txt, callback_data="act:pause_toggle:settings")],
         [
             InlineKeyboardButton(text="⏱ 5м", callback_data="act:iv:5:settings"),
             InlineKeyboardButton(text="⏱ 15м", callback_data="act:iv:15:settings"),
             InlineKeyboardButton(text="⏱ 60м", callback_data="act:iv:60:settings"),
         ],
         [InlineKeyboardButton(text="⟲ Сбросить интервал", callback_data="act:iv_reset:settings")],
+        [InlineKeyboardButton(text="♻️ Сбросить доставку (мне)", callback_data="scr:reset_confirm")],
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="scr:menu")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _kb_reset_confirm() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="✅ Да, сбросить", callback_data="act:reset_deliveries")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="scr:settings")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -221,6 +284,27 @@ def _kb_help() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _kb_packs(packs: list[PackRow], selected: set[int], page: int, pages: int, delivery_enabled: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for p in packs:
+        mark = "✅" if p.id in selected else "➕"
+        rows.append([InlineKeyboardButton(text=f"{mark} {p.title}", callback_data=f"act:pk:{p.id}:{page}")])
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"scr:packs:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{max(pages,1)}", callback_data="noop"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"scr:packs:{page+1}"))
+    rows.append(nav)
+
+    d_txt = "Рассылка: ВКЛ ✅" if delivery_enabled else "Рассылка: ВЫКЛ ⛔️"
+    rows.append([InlineKeyboardButton(text=d_txt, callback_data=f"act:delivery_toggle:packs:{page}")])
+    rows.append([InlineKeyboardButton(text="⚙️ Настройки", callback_data="scr:settings")])
+    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="scr:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def _safe_edit_text(cb: CallbackQuery, text0: str, kb: InlineKeyboardMarkup) -> None:
     if not cb.message:
         return
@@ -229,7 +313,6 @@ async def _safe_edit_text(cb: CallbackQuery, text0: str, kb: InlineKeyboardMarku
     except TelegramBadRequest as e:
         if "message is not modified" in str(e):
             return
-        # если нельзя редактировать текст — попробуем только клавиатуру
         try:
             await cb.message.edit_reply_markup(reply_markup=kb)
         except TelegramBadRequest as e2:
@@ -367,27 +450,6 @@ async def _channels_for_pack_ids(session, pack_ids: list[int]) -> list[str]:
     return [u.lstrip("@") for u in usernames]
 
 
-def _kb_packs(packs: list[PackRow], selected: set[int], page: int, pages: int, delivery_enabled: bool) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for p in packs:
-        mark = "✅" if p.id in selected else "➕"
-        rows.append([InlineKeyboardButton(text=f"{mark} {p.title}", callback_data=f"act:pk:{p.id}:{page}")])
-
-    nav: list[InlineKeyboardButton] = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"scr:packs:{page-1}"))
-    nav.append(InlineKeyboardButton(text=f"{page+1}/{max(pages,1)}", callback_data="noop"))
-    if page + 1 < pages:
-        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"scr:packs:{page+1}"))
-    rows.append(nav)
-
-    d_txt = "Рассылка: ВКЛ ✅" if delivery_enabled else "Рассылка: ВЫКЛ ⛔️"
-    rows.append([InlineKeyboardButton(text=d_txt, callback_data=f"act:delivery_toggle:packs:{page}")])
-    rows.append([InlineKeyboardButton(text="⚙️ Настройки", callback_data="scr:settings")])
-    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="scr:menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
 async def _render_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     async with session_scope() as session:
         s = await _get_user_settings(session, user_id)
@@ -400,6 +462,11 @@ async def _render_settings(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         s = await _get_user_settings(session, user_id)
     text0 = "⚙️ Настройки\n\n" + _fmt_settings(s) + "\n\nБыстрые действия:"
     return text0, _kb_settings(s)
+
+
+async def _render_reset_confirm(_user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    text0 = "♻️ Сбросить доставку\n\nЭто удалит историю доставок *только для тебя*.\nПосле этого worker сможет прислать посты заново.\n\nПодтвердить?"
+    return text0, _kb_reset_confirm()
 
 
 async def _render_packs(user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -496,7 +563,7 @@ async def _render_help() -> tuple[str, InlineKeyboardMarkup]:
         "Логика:\n"
         "• Harvester собирает посты в БД (posts_cache)\n"
         "• Worker рассылает (deliveries — защита от дублей)\n"
-        "• Включение/интервал — в настройках (user_settings)\n"
+        "• Настройки/пауза — в user_settings\n"
     )
     return text0, _kb_help()
 
@@ -506,6 +573,8 @@ async def _render_screen(user_id: int, screen: str, page: int = 0) -> tuple[str,
         return await _render_menu(user_id)
     if screen == "settings":
         return await _render_settings(user_id)
+    if screen == "reset_confirm":
+        return await _render_reset_confirm(user_id)
     if screen == "packs":
         return await _render_packs(user_id, page)
     if screen == "channels":
@@ -583,14 +652,12 @@ async def _open_menu_message(bot: Bot, tg_id: int, chat_id: int, prefer_edit: bo
 @dp.message(CommandStart())
 async def start(m: Message):
     logger.info("start tg_id=%s", m.from_user.id)
-    bot = m.bot
-    await _open_menu_message(bot, m.from_user.id, m.chat.id, prefer_edit=True)
+    await _open_menu_message(m.bot, m.from_user.id, m.chat.id, prefer_edit=True)
 
 
 @dp.message(Command("menu"))
 async def menu_cmd(m: Message):
-    bot = m.bot
-    await _open_menu_message(bot, m.from_user.id, m.chat.id, prefer_edit=True)
+    await _open_menu_message(m.bot, m.from_user.id, m.chat.id, prefer_edit=True)
 
 
 @dp.message(Command("packs"))
@@ -656,6 +723,27 @@ async def action_router(cb: CallbackQuery):
         await cb.answer("OK")
         return
 
+    if act == "pause_toggle":
+        async with session_scope() as session:
+            s = await _get_user_settings(session, user.id)
+            pu = s.get("pause_until")
+            paused = False
+            if pu:
+                try:
+                    if pu.tzinfo is None:
+                        pu = pu.replace(tzinfo=timezone.utc)
+                    paused = pu > datetime.now(timezone.utc)
+                except Exception:
+                    paused = False
+            if paused:
+                await _pause_clear(session, user.id)
+            else:
+                await _pause_for_seconds(session, user.id, 3600)
+        text0, kb = await _render_screen(user.id, screen, page=page)
+        await _safe_edit_text(cb, text0, kb)
+        await cb.answer("OK")
+        return
+
     if act == "iv":
         # act:iv:<minutes>:<screen>[:page]
         minutes = 0
@@ -701,6 +789,16 @@ async def action_router(cb: CallbackQuery):
         if cb.message:
             await cb.message.answer("Собираю дайджест…")
             await _manual_digest(user.id, cb.message)
+        await cb.answer("OK")
+        return
+
+    if act == "reset_deliveries":
+        async with session_scope() as session:
+            n = await _reset_deliveries_for_user(session, user.id)
+        if cb.message:
+            await cb.message.answer(f"Ок. Сброшено доставок: {n}.")
+        text0, kb = await _render_screen(user.id, "settings")
+        await _safe_edit_text(cb, text0, kb)
         await cb.answer("OK")
         return
 

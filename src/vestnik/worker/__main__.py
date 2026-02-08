@@ -108,12 +108,15 @@ async def _ensure_user_settings(session) -> None:
               user_id integer primary key,
               delivery_enabled boolean not null default true,
               digest_interval_sec integer null,
-              last_sent_at timestamptz null
+              last_sent_at timestamptz null,
+              pause_until timestamptz null
             );
             """
         )
     )
+    await session.execute(text("alter table user_settings add column if not exists pause_until timestamptz;"))
     await session.execute(text("create index if not exists ix_user_settings_delivery_enabled on user_settings(delivery_enabled);"))
+    await session.execute(text("create index if not exists ix_user_settings_pause_until on user_settings(pause_until);"))
     await session.commit()
 
 
@@ -125,18 +128,18 @@ async def _ensure_user_settings_row(session, user_id: int) -> None:
     await session.commit()
 
 
-async def _get_user_settings(session, user_id: int) -> tuple[bool, int | None, datetime | None]:
+async def _get_user_settings(session, user_id: int) -> tuple[bool, int | None, datetime | None, datetime | None]:
     await _ensure_user_settings(session)
     await _ensure_user_settings_row(session, user_id)
     row = (
         await session.execute(
-            text("select delivery_enabled, digest_interval_sec, last_sent_at from user_settings where user_id=:uid"),
+            text("select delivery_enabled, digest_interval_sec, last_sent_at, pause_until from user_settings where user_id=:uid"),
             {"uid": user_id},
         )
     ).first()
     if not row:
-        return True, None, None
-    return bool(row[0]), (int(row[1]) if row[1] is not None else None), row[2]
+        return True, None, None, None
+    return bool(row[0]), (int(row[1]) if row[1] is not None else None), row[2], row[3]
 
 
 @dataclass(frozen=True)
@@ -154,8 +157,8 @@ class PostRow:
 
 
 async def _fetch_users(session) -> list[UserRow]:
-    # user_settings.delivery_enabled respected
     await _ensure_user_settings(session)
+    now = datetime.now(timezone.utc)
     res = await session.execute(
         text(
             """
@@ -164,9 +167,11 @@ async def _fetch_users(session) -> list[UserRow]:
             left join user_settings s on s.user_id = u.id
             where u.tg_id is not null
               and coalesce(s.delivery_enabled, true) = true
+              and (s.pause_until is null or s.pause_until <= :now)
             order by u.id
             """
-        )
+        ),
+        {"now": now},
     )
     out: list[UserRow] = []
     for r in res.all():
@@ -277,7 +282,7 @@ def _build_digest(posts: list[PostRow], max_chars: int = 3800) -> str:
         if len(t) > 180:
             t = t[:180] + "…"
         url = (p.url or "").strip() or f"https://t.me/{p.channel_ref}/{p.message_id}"
-        chunk = f"{p.channel_ref}: {t}\n{url}\n\n"
+        chunk = f"@{p.channel_ref}: {t}\n{url}\n\n"
         if len(out) + len(chunk) > max_chars:
             break
         out += chunk
@@ -317,11 +322,20 @@ async def _oneshot() -> None:
         sent_users = 0
         for u in users:
             try:
-                delivery_enabled, interval_sec, last_sent_at = await _get_user_settings(session, u.id)
+                delivery_enabled, interval_sec, last_sent_at, pause_until = await _get_user_settings(session, u.id)
                 if not delivery_enabled:
                     continue
 
-                # per-user throttle (если задан)
+                if pause_until:
+                    try:
+                        pu = pause_until
+                        if pu.tzinfo is None:
+                            pu = pu.replace(tzinfo=timezone.utc)
+                        if pu > datetime.now(timezone.utc):
+                            continue
+                    except Exception:
+                        pass
+
                 if interval_sec and last_sent_at:
                     delta = (datetime.now(timezone.utc) - last_sent_at).total_seconds()
                     if delta < float(interval_sec):
