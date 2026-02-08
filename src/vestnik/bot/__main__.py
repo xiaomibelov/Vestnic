@@ -11,7 +11,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from sqlalchemy import select, text
 
 from vestnik.db import session_scope
-from vestnik.models import Channel, PostCache, User
+from vestnik.models import PostCache, User
 from vestnik.settings import BOT_TOKEN
 
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +30,12 @@ def _safe_ident(name: str) -> str:
     if not re.fullmatch(r"[a-zA-Z0-9_]+", name or ""):
         raise ValueError(f"unsafe identifier: {name!r}")
     return name
+
+
+def _chunks(items: list, n: int) -> list[list]:
+    if n <= 0:
+        return [items]
+    return [items[i : i + n] for i in range(0, len(items), n)]
 
 
 async def _list_tables(session) -> set[str]:
@@ -78,11 +84,15 @@ async def _ensure_user_settings(session) -> None:
               user_id integer primary key,
               delivery_enabled boolean not null default true,
               digest_interval_sec integer null,
-              last_sent_at timestamptz null
+              last_sent_at timestamptz null,
+              menu_chat_id bigint null,
+              menu_message_id integer null
             );
             """
         )
     )
+    await session.execute(text("alter table user_settings add column if not exists menu_chat_id bigint;"))
+    await session.execute(text("alter table user_settings add column if not exists menu_message_id integer;"))
     await session.execute(text("create index if not exists ix_user_settings_delivery_enabled on user_settings(delivery_enabled);"))
     await session.commit()
 
@@ -101,23 +111,45 @@ async def _ensure_user_settings_row(session, user_id: int) -> None:
     await session.commit()
 
 
-async def _get_user_settings(session, user_id: int) -> tuple[bool, int | None, datetime | None]:
+async def _get_user_settings(session, user_id: int) -> dict:
     await _ensure_user_settings(session)
     await _ensure_user_settings_row(session, user_id)
     row = (
         await session.execute(
-            text("select delivery_enabled, digest_interval_sec, last_sent_at from user_settings where user_id=:uid"),
+            text(
+                """
+                select delivery_enabled, digest_interval_sec, last_sent_at, menu_chat_id, menu_message_id
+                from user_settings where user_id=:uid
+                """
+            ),
             {"uid": user_id},
         )
     ).first()
     if not row:
-        return True, None, None
-    return bool(row[0]), (int(row[1]) if row[1] is not None else None), row[2]
+        return {"delivery_enabled": True, "digest_interval_sec": None, "last_sent_at": None, "menu_chat_id": None, "menu_message_id": None}
+
+    return {
+        "delivery_enabled": bool(row[0]),
+        "digest_interval_sec": (int(row[1]) if row[1] is not None else None),
+        "last_sent_at": row[2],
+        "menu_chat_id": row[3],
+        "menu_message_id": row[4],
+    }
+
+
+async def _set_menu_message(session, user_id: int, chat_id: int, message_id: int) -> None:
+    await _ensure_user_settings(session)
+    await _ensure_user_settings_row(session, user_id)
+    await session.execute(
+        text("update user_settings set menu_chat_id=:c, menu_message_id=:m where user_id=:uid"),
+        {"c": int(chat_id), "m": int(message_id), "uid": int(user_id)},
+    )
+    await session.commit()
 
 
 async def _toggle_delivery(session, user_id: int) -> bool:
-    enabled, _, _ = await _get_user_settings(session, user_id)
-    new_val = not enabled
+    cur = await _get_user_settings(session, user_id)
+    new_val = not bool(cur["delivery_enabled"])
     await session.execute(
         text("update user_settings set delivery_enabled=:v where user_id=:uid"),
         {"v": new_val, "uid": user_id},
@@ -126,71 +158,99 @@ async def _toggle_delivery(session, user_id: int) -> bool:
     return new_val
 
 
-async def _set_interval_minutes(session, user_id: int, minutes: int) -> None:
-    sec = max(int(minutes) * 60, 60)
+async def _set_interval_minutes(session, user_id: int, minutes: int | None) -> None:
     await _ensure_user_settings(session)
     await _ensure_user_settings_row(session, user_id)
-    await session.execute(
-        text("update user_settings set digest_interval_sec=:sec where user_id=:uid"),
-        {"sec": sec, "uid": user_id},
-    )
+
+    if minutes is None or minutes <= 0:
+        await session.execute(text("update user_settings set digest_interval_sec=null where user_id=:uid"), {"uid": user_id})
+        await session.commit()
+        return
+
+    sec = max(int(minutes) * 60, 60)
+    await session.execute(text("update user_settings set digest_interval_sec=:sec where user_id=:uid"), {"sec": sec, "uid": user_id})
     await session.commit()
 
 
-def _settings_text(delivery_enabled: bool, interval_sec: int | None, last_sent_at) -> str:
-    st = "ВКЛ ✅" if delivery_enabled else "ВЫКЛ ⛔️"
-    if interval_sec:
-        mins = max(int(interval_sec // 60), 1)
+def _fmt_settings(s: dict) -> str:
+    st = "ВКЛ ✅" if s["delivery_enabled"] else "ВЫКЛ ⛔️"
+    if s["digest_interval_sec"]:
+        mins = max(int(s["digest_interval_sec"] // 60), 1)
         iv = f"{mins} мин"
     else:
         iv = "глобальная (env)"
-    last = last_sent_at.isoformat() if last_sent_at else "-"
-    return f"Настройки:\nРассылка: {st}\nИнтервал: {iv}\nПоследняя отправка: {last}"
+    last = s["last_sent_at"].isoformat() if s["last_sent_at"] else "-"
+    return f"Рассылка: {st}\nИнтервал: {iv}\nПоследняя отправка: {last}"
 
 
-def _settings_kb(delivery_enabled: bool) -> InlineKeyboardMarkup:
-    btn = "Отключить рассылку" if delivery_enabled else "Включить рассылку"
+def _kb_menu() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text=btn, callback_data="delivery:toggle")],
-        [InlineKeyboardButton(text="Паки", callback_data="ui:packs")],
-        [InlineKeyboardButton(text="Дайджест сейчас", callback_data="ui:digest_now")],
+        [InlineKeyboardButton(text="📦 Паки", callback_data="scr:packs:0")],
+        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="scr:settings")],
+        [InlineKeyboardButton(text="📰 Дайджест сейчас", callback_data="act:digest_now")],
+        [InlineKeyboardButton(text="📡 Каналы", callback_data="scr:channels")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="scr:stats")],
+        [InlineKeyboardButton(text="ℹ️ Помощь", callback_data="scr:help")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def packs_keyboard(packs: list[PackRow], selected_ids: set[int], delivery_enabled: bool) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for p in packs:
-        mark = "✅" if p.id in selected_ids else "➕"
-        rows.append([InlineKeyboardButton(text=f"{mark} {p.title}", callback_data=f"pack:{p.id}")])
+def _kb_back(to: str = "menu") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"scr:{to}")]])
 
-    delivery_txt = "Рассылка: ВКЛ ✅" if delivery_enabled else "Рассылка: ВЫКЛ ⛔️"
-    rows.append([InlineKeyboardButton(text=delivery_txt, callback_data="delivery:toggle")])
-    rows.append([InlineKeyboardButton(text="Обновить", callback_data="packs:refresh")])
-    rows.append([InlineKeyboardButton(text="Настройки", callback_data="ui:settings")])
+
+def _kb_settings(s: dict) -> InlineKeyboardMarkup:
+    toggle_txt = "Отключить рассылку" if s["delivery_enabled"] else "Включить рассылку"
+    rows = [
+        [InlineKeyboardButton(text=toggle_txt, callback_data="act:delivery_toggle:settings")],
+        [
+            InlineKeyboardButton(text="⏱ 5м", callback_data="act:iv:5:settings"),
+            InlineKeyboardButton(text="⏱ 15м", callback_data="act:iv:15:settings"),
+            InlineKeyboardButton(text="⏱ 60м", callback_data="act:iv:60:settings"),
+        ],
+        [InlineKeyboardButton(text="⟲ Сбросить интервал", callback_data="act:iv_reset:settings")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="scr:menu")],
+    ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def safe_edit_reply_markup(cb: CallbackQuery, markup: InlineKeyboardMarkup) -> None:
+def _kb_help() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="scr:menu")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _safe_edit_text(cb: CallbackQuery, text0: str, kb: InlineKeyboardMarkup) -> None:
     if not cb.message:
         return
     try:
-        await cb.message.edit_reply_markup(reply_markup=markup)
+        await cb.message.edit_text(text0, reply_markup=kb)
     except TelegramBadRequest as e:
         if "message is not modified" in str(e):
             return
-        raise
+        # если нельзя редактировать текст — попробуем только клавиатуру
+        try:
+            await cb.message.edit_reply_markup(reply_markup=kb)
+        except TelegramBadRequest as e2:
+            if "message is not modified" in str(e2):
+                return
+            raise
 
 
 async def ensure_user(tg_id: int) -> User:
     async with session_scope() as session:
         user = (await session.execute(select(User).where(User.tg_id == tg_id))).scalars().first()
         if user:
+            await _ensure_user_settings(session)
+            await _ensure_user_settings_row(session, user.id)
             return user
         user = User(tg_id=tg_id, role="guest")
         session.add(user)
         await session.commit()
         await session.refresh(user)
+        await _ensure_user_settings(session)
+        await _ensure_user_settings_row(session, user.id)
         return user
 
 
@@ -307,190 +367,173 @@ async def _channels_for_pack_ids(session, pack_ids: list[int]) -> list[str]:
     return [u.lstrip("@") for u in usernames]
 
 
-async def _render_packs_ui(tg_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    await ensure_user(tg_id)
+def _kb_packs(packs: list[PackRow], selected: set[int], page: int, pages: int, delivery_enabled: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for p in packs:
+        mark = "✅" if p.id in selected else "➕"
+        rows.append([InlineKeyboardButton(text=f"{mark} {p.title}", callback_data=f"act:pk:{p.id}:{page}")])
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"scr:packs:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{max(pages,1)}", callback_data="noop"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"scr:packs:{page+1}"))
+    rows.append(nav)
+
+    d_txt = "Рассылка: ВКЛ ✅" if delivery_enabled else "Рассылка: ВЫКЛ ⛔️"
+    rows.append([InlineKeyboardButton(text=d_txt, callback_data=f"act:delivery_toggle:packs:{page}")])
+    rows.append([InlineKeyboardButton(text="⚙️ Настройки", callback_data="scr:settings")])
+    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="scr:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _render_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     async with session_scope() as session:
-        user = (await session.execute(select(User).where(User.tg_id == tg_id))).scalars().first()
-        if not user:
-            return "Пользователь не найден.", InlineKeyboardMarkup(inline_keyboard=[])
-
-        delivery_enabled, interval_sec, last_sent = await _get_user_settings(session, user.id)
-
-        packs = await _fetch_packs(session)
-        selected = await _selected_pack_ids(session, user.id)
-
-    title = _settings_text(delivery_enabled, interval_sec, last_sent) + "\n\nВыбери паки:"
-    return title, packs_keyboard(packs, selected, delivery_enabled)
+        s = await _get_user_settings(session, user_id)
+    text0 = "Честный вестник\n\n" + _fmt_settings(s)
+    return text0, _kb_menu()
 
 
-@dp.message(CommandStart())
-async def start(m: Message):
-    logger.info("start tg_id=%s", m.from_user.id)
-    title, kb = await _render_packs_ui(m.from_user.id)
-    await m.answer(title, reply_markup=kb)
-
-
-@dp.message(Command("packs"))
-async def packs_cmd(m: Message):
-    logger.info("packs tg_id=%s", m.from_user.id)
-    title, kb = await _render_packs_ui(m.from_user.id)
-    await m.answer(title, reply_markup=kb)
-
-
-@dp.message(Command("settings"))
-async def settings_cmd(m: Message):
-    logger.info("settings tg_id=%s", m.from_user.id)
-    await ensure_user(m.from_user.id)
+async def _render_settings(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     async with session_scope() as session:
-        user = (await session.execute(select(User).where(User.tg_id == m.from_user.id))).scalars().first()
-        if not user:
-            await m.answer("Пользователь не найден.")
-            return
-        enabled, interval_sec, last_sent = await _get_user_settings(session, user.id)
-    await m.answer(_settings_text(enabled, interval_sec, last_sent), reply_markup=_settings_kb(enabled))
+        s = await _get_user_settings(session, user_id)
+    text0 = "⚙️ Настройки\n\n" + _fmt_settings(s) + "\n\nБыстрые действия:"
+    return text0, _kb_settings(s)
 
 
-@dp.message(Command("interval"))
-async def interval_cmd(m: Message):
-    logger.info("interval tg_id=%s", m.from_user.id)
-    parts = (m.text or "").strip().split()
-    if len(parts) < 2:
-        await m.answer("Использование: /interval 15  (минуты). Чтобы сбросить: /interval 0")
-        return
-    try:
-        minutes = int(parts[1])
-    except Exception:
-        await m.answer("Нужно число минут. Пример: /interval 15")
-        return
-
-    await ensure_user(m.from_user.id)
+async def _render_packs(user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
     async with session_scope() as session:
-        user = (await session.execute(select(User).where(User.tg_id == m.from_user.id))).scalars().first()
-        if not user:
-            await m.answer("Пользователь не найден.")
-            return
-        await _ensure_user_settings(session)
-        await _ensure_user_settings_row(session, user.id)
+        s = await _get_user_settings(session, user_id)
+        packs_all = await _fetch_packs(session)
+        selected = await _selected_pack_ids(session, user_id)
 
-        if minutes <= 0:
-            await session.execute(text("update user_settings set digest_interval_sec=null where user_id=:uid"), {"uid": user.id})
-            await session.commit()
-            enabled, interval_sec, last_sent = await _get_user_settings(session, user.id)
-            await m.answer("Интервал сброшен. Теперь используется глобальная настройка.", reply_markup=_settings_kb(enabled))
-            return
+    per_page = 10
+    pages = max((len(packs_all) + per_page - 1) // per_page, 1)
+    page = max(min(page, pages - 1), 0)
+    chunk = packs_all[page * per_page : (page + 1) * per_page]
 
-        await _set_interval_minutes(session, user.id, minutes)
-        enabled, interval_sec, last_sent = await _get_user_settings(session, user.id)
-        await m.answer(f"Ок. Персональный интервал: {max(interval_sec // 60, 1)} мин", reply_markup=_settings_kb(enabled))
+    text0 = f"📦 Паки (выбрано: {len(selected)})\n\nНажми, чтобы включить/выключить."
+    return text0, _kb_packs(chunk, selected, page, pages, bool(s["delivery_enabled"]))
 
 
-@dp.callback_query(F.data == "ui:settings")
-async def ui_settings(cb: CallbackQuery):
-    await ensure_user(cb.from_user.id)
+async def _render_channels(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     async with session_scope() as session:
-        user = (await session.execute(select(User).where(User.tg_id == cb.from_user.id))).scalars().first()
-        if not user:
-            await cb.answer("user not found", show_alert=True)
-            return
-        enabled, interval_sec, last_sent = await _get_user_settings(session, user.id)
-    if cb.message:
-        await cb.message.answer(_settings_text(enabled, interval_sec, last_sent), reply_markup=_settings_kb(enabled))
-    await cb.answer("OK")
-
-
-@dp.callback_query(F.data == "ui:packs")
-async def ui_packs(cb: CallbackQuery):
-    title, kb = await _render_packs_ui(cb.from_user.id)
-    if cb.message:
-        await cb.message.answer(title, reply_markup=kb)
-    await cb.answer("OK")
-
-
-@dp.callback_query(F.data == "delivery:toggle")
-async def delivery_toggle(cb: CallbackQuery):
-    await ensure_user(cb.from_user.id)
-    async with session_scope() as session:
-        user = (await session.execute(select(User).where(User.tg_id == cb.from_user.id))).scalars().first()
-        if not user:
-            await cb.answer("user not found", show_alert=True)
-            return
-        new_val = await _toggle_delivery(session, user.id)
-        enabled, interval_sec, last_sent = await _get_user_settings(session, user.id)
-
-    if cb.message:
-        await cb.message.answer(_settings_text(enabled, interval_sec, last_sent), reply_markup=_settings_kb(new_val))
-    await cb.answer("OK")
-
-
-@dp.callback_query(F.data == "packs:refresh")
-async def packs_refresh(cb: CallbackQuery):
-    title, kb = await _render_packs_ui(cb.from_user.id)
-    if cb.message:
-        try:
-            await cb.message.edit_text(title, reply_markup=kb)
-        except TelegramBadRequest:
-            await safe_edit_reply_markup(cb, kb)
-    await cb.answer("OK")
-
-
-@dp.callback_query(F.data.startswith("pack:"))
-async def pack_toggle(cb: CallbackQuery):
-    pack_id = int(cb.data.split(":", 1)[1])
-    logger.info("pack_toggle tg_id=%s pack_id=%s", cb.from_user.id, pack_id)
-    await ensure_user(cb.from_user.id)
-
-    async with session_scope() as session:
-        user = (await session.execute(select(User).where(User.tg_id == cb.from_user.id))).scalars().first()
-        if not user:
-            await cb.answer("user not found", show_alert=True)
-            return
-        await _toggle_pack(session, user.id, pack_id)
-
-    title, kb = await _render_packs_ui(cb.from_user.id)
-    if cb.message:
-        try:
-            await cb.message.edit_text(title, reply_markup=kb)
-        except TelegramBadRequest:
-            await safe_edit_reply_markup(cb, kb)
-    await cb.answer("OK")
-
-
-@dp.callback_query(F.data == "ui:digest_now")
-async def ui_digest_now(cb: CallbackQuery):
-    if cb.message:
-        await cb.message.answer("Собираю дайджест…")
-    await cb.answer("OK")
-    await _send_digest_to_user(cb.from_user.id, cb.message)
-
-
-async def _send_digest_to_user(tg_id: int, msg_ctx: Message | None) -> None:
-    await ensure_user(tg_id)
-    now = datetime.now(timezone.utc)
-
-    async with session_scope() as session:
-        user = (await session.execute(select(User).where(User.tg_id == tg_id))).scalars().first()
-        if not user:
-            if msg_ctx:
-                await msg_ctx.answer("Пользователь не найден.")
-            return
-
-        selected = await _selected_pack_ids(session, user.id)
+        selected = await _selected_pack_ids(session, user_id)
         if not selected:
-            if msg_ctx:
-                await msg_ctx.answer("Паки не выбраны. Используй /packs.")
-            return
+            return "📡 Каналы\n\nПаки не выбраны. Сначала выбери паки.", _kb_back("menu")
 
-        channel_refs = await _channels_for_pack_ids(session, list(selected))
-        if not channel_refs:
-            if msg_ctx:
-                await msg_ctx.answer("Для выбранных паков нет активных каналов.")
+        refs = await _channels_for_pack_ids(session, list(selected))
+        if not refs:
+            return "📡 Каналы\n\nДля выбранных паков нет активных каналов.", _kb_back("menu")
+
+        sql = text(
+            """
+            select channel_ref, count(*) as cnt, max(message_id) as max_mid
+            from posts_cache
+            where is_deleted=false and channel_ref = any(:refs)
+            group by channel_ref
+            order by cnt desc, channel_ref asc
+            """
+        )
+        res = await session.execute(sql, {"refs": refs})
+        rows = res.all()
+
+    lines = ["📡 Каналы (по выбранным пакам):", ""]
+    for r in rows[:40]:
+        lines.append(f"@{r[0]} — {int(r[1])} постов (max id {r[2]})")
+    if len(rows) > 40:
+        lines.append("")
+        lines.append(f"…и ещё {len(rows)-40}")
+
+    return "\n".join(lines).strip(), _kb_back("menu")
+
+
+async def _render_stats(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_scope() as session:
+        s = await _get_user_settings(session, user_id)
+        selected = await _selected_pack_ids(session, user_id)
+
+        posts_total = (await session.execute(text("select count(*) from posts_cache"))).scalar_one()
+        deliveries_total = (await session.execute(text("select count(*) from deliveries"))).scalar_one()
+
+        unsent = (await session.execute(
+            text(
+                """
+                select count(*)
+                from posts_cache p
+                left join deliveries d
+                  on d.user_id = :uid
+                 and d.channel_ref = p.channel_ref
+                 and d.message_id = p.message_id
+                where d.id is null
+                  and p.is_deleted=false
+                  and p.expires_at > now()
+                """
+            ),
+            {"uid": user_id},
+        )).scalar_one()
+
+    text0 = (
+        "📊 Статистика\n\n"
+        f"{_fmt_settings(s)}\n\n"
+        f"Выбрано паков: {len(selected)}\n"
+        f"posts_cache: {int(posts_total)}\n"
+        f"deliveries (все): {int(deliveries_total)}\n"
+        f"не доставлено (тебе): {int(unsent)}"
+    )
+    return text0, _kb_back("menu")
+
+
+async def _render_help() -> tuple[str, InlineKeyboardMarkup]:
+    text0 = (
+        "ℹ️ Помощь\n\n"
+        "Команды:\n"
+        "/menu — открыть меню\n"
+        "/packs — паки\n"
+        "/settings — настройки\n"
+        "/digest — ручной дайджест\n\n"
+        "Логика:\n"
+        "• Harvester собирает посты в БД (posts_cache)\n"
+        "• Worker рассылает (deliveries — защита от дублей)\n"
+        "• Включение/интервал — в настройках (user_settings)\n"
+    )
+    return text0, _kb_help()
+
+
+async def _render_screen(user_id: int, screen: str, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    if screen == "menu":
+        return await _render_menu(user_id)
+    if screen == "settings":
+        return await _render_settings(user_id)
+    if screen == "packs":
+        return await _render_packs(user_id, page)
+    if screen == "channels":
+        return await _render_channels(user_id)
+    if screen == "stats":
+        return await _render_stats(user_id)
+    if screen == "help":
+        return await _render_help()
+    return await _render_menu(user_id)
+
+
+async def _manual_digest(user_id: int, msg_ctx: Message) -> None:
+    now = datetime.now(timezone.utc)
+    async with session_scope() as session:
+        selected = await _selected_pack_ids(session, user_id)
+        if not selected:
+            await msg_ctx.answer("Паки не выбраны. Открой /packs.")
+            return
+        refs = await _channels_for_pack_ids(session, list(selected))
+        if not refs:
+            await msg_ctx.answer("Для выбранных паков нет активных каналов.")
             return
 
         posts = (
             await session.execute(
                 select(PostCache)
                 .where(
-                    PostCache.channel_ref.in_(list(channel_refs)),
+                    PostCache.channel_ref.in_(list(refs)),
                     PostCache.is_deleted == False,
                     PostCache.expires_at > now,
                 )
@@ -500,29 +543,168 @@ async def _send_digest_to_user(tg_id: int, msg_ctx: Message | None) -> None:
         ).scalars().all()
 
     if not posts:
-        if msg_ctx:
-            await msg_ctx.answer("Нет свежих постов (harvester ещё не собрал новые данные).")
+        await msg_ctx.answer("Нет свежих постов (harvester ещё не собрал новые данные).")
         return
 
-    out = "Дайджест (ручной):\n\n"
+    out = "📰 Дайджест (ручной):\n\n"
     for p in posts:
         text0 = (p.text or "").strip().replace("\n", " ")
         if len(text0) > 180:
             text0 = text0[:180] + "…"
         url = (p.url or "").strip() or f"https://t.me/{p.channel_ref}/{p.message_id}"
-        chunk = f"{p.channel_ref}: {text0}\n{url}\n\n"
+        chunk = f"@{p.channel_ref}: {text0}\n{url}\n\n"
         if len(out) + len(chunk) > 3800:
             break
         out += chunk
+    await msg_ctx.answer(out.strip())
 
-    if msg_ctx:
-        await msg_ctx.answer(out)
+
+async def _open_menu_message(bot: Bot, tg_id: int, chat_id: int, prefer_edit: bool = True) -> None:
+    user = await ensure_user(tg_id)
+    async with session_scope() as session:
+        s = await _get_user_settings(session, user.id)
+        menu_chat_id = s["menu_chat_id"]
+        menu_message_id = s["menu_message_id"]
+
+    text0, kb = await _render_screen(user.id, "menu")
+
+    if prefer_edit and menu_chat_id and menu_message_id and int(menu_chat_id) == int(chat_id):
+        try:
+            await bot.edit_message_text(text0, chat_id=int(chat_id), message_id=int(menu_message_id), reply_markup=kb)
+            return
+        except Exception:
+            pass
+
+    m = await bot.send_message(chat_id, text0, reply_markup=kb)
+    async with session_scope() as session:
+        await _set_menu_message(session, user.id, int(chat_id), int(m.message_id))
+
+
+@dp.message(CommandStart())
+async def start(m: Message):
+    logger.info("start tg_id=%s", m.from_user.id)
+    bot = m.bot
+    await _open_menu_message(bot, m.from_user.id, m.chat.id, prefer_edit=True)
+
+
+@dp.message(Command("menu"))
+async def menu_cmd(m: Message):
+    bot = m.bot
+    await _open_menu_message(bot, m.from_user.id, m.chat.id, prefer_edit=True)
+
+
+@dp.message(Command("packs"))
+async def packs_cmd(m: Message):
+    user = await ensure_user(m.from_user.id)
+    text0, kb = await _render_screen(user.id, "packs", page=0)
+    await m.answer(text0, reply_markup=kb)
+
+
+@dp.message(Command("settings"))
+async def settings_cmd(m: Message):
+    user = await ensure_user(m.from_user.id)
+    text0, kb = await _render_screen(user.id, "settings")
+    await m.answer(text0, reply_markup=kb)
 
 
 @dp.message(Command("digest"))
 async def digest_cmd(m: Message):
-    logger.info("digest tg_id=%s", m.from_user.id)
-    await _send_digest_to_user(m.from_user.id, m)
+    user = await ensure_user(m.from_user.id)
+    await _manual_digest(user.id, m)
+
+
+@dp.callback_query(F.data == "noop")
+async def noop(cb: CallbackQuery):
+    await cb.answer("")
+
+
+@dp.callback_query(F.data.startswith("scr:"))
+async def screen_router(cb: CallbackQuery):
+    user = await ensure_user(cb.from_user.id)
+    parts = (cb.data or "").split(":")
+    screen = parts[1] if len(parts) > 1 else "menu"
+    page = 0
+    if screen == "packs" and len(parts) > 2:
+        try:
+            page = int(parts[2])
+        except Exception:
+            page = 0
+
+    text0, kb = await _render_screen(user.id, screen, page=page)
+    await _safe_edit_text(cb, text0, kb)
+    await cb.answer("OK")
+
+
+@dp.callback_query(F.data.startswith("act:"))
+async def action_router(cb: CallbackQuery):
+    user = await ensure_user(cb.from_user.id)
+    parts = (cb.data or "").split(":")
+    act = parts[1] if len(parts) > 1 else ""
+    screen = parts[2] if len(parts) > 2 else "menu"
+    page = 0
+    if len(parts) > 3:
+        try:
+            page = int(parts[3])
+        except Exception:
+            page = 0
+
+    if act == "delivery_toggle":
+        async with session_scope() as session:
+            await _toggle_delivery(session, user.id)
+        text0, kb = await _render_screen(user.id, screen, page=page)
+        await _safe_edit_text(cb, text0, kb)
+        await cb.answer("OK")
+        return
+
+    if act == "iv":
+        # act:iv:<minutes>:<screen>[:page]
+        minutes = 0
+        if len(parts) > 2:
+            try:
+                minutes = int(parts[2])
+            except Exception:
+                minutes = 0
+        screen = parts[3] if len(parts) > 3 else "settings"
+        page = 0
+        if len(parts) > 4:
+            try:
+                page = int(parts[4])
+            except Exception:
+                page = 0
+        async with session_scope() as session:
+            await _set_interval_minutes(session, user.id, minutes)
+        text0, kb = await _render_screen(user.id, screen, page=page)
+        await _safe_edit_text(cb, text0, kb)
+        await cb.answer("OK")
+        return
+
+    if act == "iv_reset":
+        async with session_scope() as session:
+            await _set_interval_minutes(session, user.id, None)
+        text0, kb = await _render_screen(user.id, "settings")
+        await _safe_edit_text(cb, text0, kb)
+        await cb.answer("OK")
+        return
+
+    if act == "pk":
+        # act:pk:<pack_id>:<page>
+        pack_id = int(parts[2])
+        page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+        async with session_scope() as session:
+            await _toggle_pack(session, user.id, pack_id)
+        text0, kb = await _render_screen(user.id, "packs", page=page)
+        await _safe_edit_text(cb, text0, kb)
+        await cb.answer("OK")
+        return
+
+    if act == "digest_now":
+        if cb.message:
+            await cb.message.answer("Собираю дайджест…")
+            await _manual_digest(user.id, cb.message)
+        await cb.answer("OK")
+        return
+
+    await cb.answer("OK")
 
 
 async def main() -> None:
