@@ -26,26 +26,6 @@ class PackRow:
     title: str
 
 
-def packs_keyboard(packs: list[PackRow], selected_ids: set[int]) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for p in packs:
-        mark = "✅" if p.id in selected_ids else "➕"
-        rows.append([InlineKeyboardButton(text=f"{mark} {p.title}", callback_data=f"pack:{p.id}")])
-    rows.append([InlineKeyboardButton(text="Обновить", callback_data="packs:refresh")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def safe_edit_reply_markup(cb: CallbackQuery, markup: InlineKeyboardMarkup) -> None:
-    if not cb.message:
-        return
-    try:
-        await cb.message.edit_reply_markup(reply_markup=markup)
-    except TelegramBadRequest as e:
-        if "message is not modified" in str(e):
-            return
-        raise
-
-
 def _safe_ident(name: str) -> str:
     if not re.fullmatch(r"[a-zA-Z0-9_]+", name or ""):
         raise ValueError(f"unsafe identifier: {name!r}")
@@ -90,6 +70,118 @@ async def _resolve_pack_tables(session) -> tuple[str, str, str]:
     return packs_t, user_packs_t, pack_channels_t
 
 
+async def _ensure_user_settings(session) -> None:
+    await session.execute(
+        text(
+            """
+            create table if not exists user_settings (
+              user_id integer primary key,
+              delivery_enabled boolean not null default true,
+              digest_interval_sec integer null,
+              last_sent_at timestamptz null
+            );
+            """
+        )
+    )
+    await session.execute(text("create index if not exists ix_user_settings_delivery_enabled on user_settings(delivery_enabled);"))
+    await session.commit()
+
+
+async def _ensure_user_settings_row(session, user_id: int) -> None:
+    await session.execute(
+        text(
+            """
+            insert into user_settings (user_id)
+            values (:uid)
+            on conflict do nothing
+            """
+        ),
+        {"uid": user_id},
+    )
+    await session.commit()
+
+
+async def _get_user_settings(session, user_id: int) -> tuple[bool, int | None, datetime | None]:
+    await _ensure_user_settings(session)
+    await _ensure_user_settings_row(session, user_id)
+    row = (
+        await session.execute(
+            text("select delivery_enabled, digest_interval_sec, last_sent_at from user_settings where user_id=:uid"),
+            {"uid": user_id},
+        )
+    ).first()
+    if not row:
+        return True, None, None
+    return bool(row[0]), (int(row[1]) if row[1] is not None else None), row[2]
+
+
+async def _toggle_delivery(session, user_id: int) -> bool:
+    enabled, _, _ = await _get_user_settings(session, user_id)
+    new_val = not enabled
+    await session.execute(
+        text("update user_settings set delivery_enabled=:v where user_id=:uid"),
+        {"v": new_val, "uid": user_id},
+    )
+    await session.commit()
+    return new_val
+
+
+async def _set_interval_minutes(session, user_id: int, minutes: int) -> None:
+    sec = max(int(minutes) * 60, 60)
+    await _ensure_user_settings(session)
+    await _ensure_user_settings_row(session, user_id)
+    await session.execute(
+        text("update user_settings set digest_interval_sec=:sec where user_id=:uid"),
+        {"sec": sec, "uid": user_id},
+    )
+    await session.commit()
+
+
+def _settings_text(delivery_enabled: bool, interval_sec: int | None, last_sent_at) -> str:
+    st = "ВКЛ ✅" if delivery_enabled else "ВЫКЛ ⛔️"
+    if interval_sec:
+        mins = max(int(interval_sec // 60), 1)
+        iv = f"{mins} мин"
+    else:
+        iv = "глобальная (env)"
+    last = last_sent_at.isoformat() if last_sent_at else "-"
+    return f"Настройки:\nРассылка: {st}\nИнтервал: {iv}\nПоследняя отправка: {last}"
+
+
+def _settings_kb(delivery_enabled: bool) -> InlineKeyboardMarkup:
+    btn = "Отключить рассылку" if delivery_enabled else "Включить рассылку"
+    rows = [
+        [InlineKeyboardButton(text=btn, callback_data="delivery:toggle")],
+        [InlineKeyboardButton(text="Паки", callback_data="ui:packs")],
+        [InlineKeyboardButton(text="Дайджест сейчас", callback_data="ui:digest_now")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def packs_keyboard(packs: list[PackRow], selected_ids: set[int], delivery_enabled: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for p in packs:
+        mark = "✅" if p.id in selected_ids else "➕"
+        rows.append([InlineKeyboardButton(text=f"{mark} {p.title}", callback_data=f"pack:{p.id}")])
+
+    delivery_txt = "Рассылка: ВКЛ ✅" if delivery_enabled else "Рассылка: ВЫКЛ ⛔️"
+    rows.append([InlineKeyboardButton(text=delivery_txt, callback_data="delivery:toggle")])
+    rows.append([InlineKeyboardButton(text="Обновить", callback_data="packs:refresh")])
+    rows.append([InlineKeyboardButton(text="Настройки", callback_data="ui:settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def safe_edit_reply_markup(cb: CallbackQuery, markup: InlineKeyboardMarkup) -> None:
+    if not cb.message:
+        return
+    try:
+        await cb.message.edit_reply_markup(reply_markup=markup)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            return
+        raise
+
+
 async def ensure_user(tg_id: int) -> User:
     async with session_scope() as session:
         user = (await session.execute(select(User).where(User.tg_id == tg_id))).scalars().first()
@@ -121,10 +213,7 @@ async def _fetch_packs(session) -> list[PackRow]:
     sql = f"select {_safe_ident(id_col)} as id, {_safe_ident(title_col)} as title from {_safe_ident(packs_t)} {where_sql} order by {_safe_ident(id_col)}"
     res = await session.execute(text(sql))
     rows = res.all()
-    out: list[PackRow] = []
-    for r in rows:
-        out.append(PackRow(id=int(r[0]), title=str(r[1])))
-    return out
+    return [PackRow(id=int(r[0]), title=str(r[1])) for r in rows]
 
 
 async def _selected_pack_ids(session, user_id: int) -> set[int]:
@@ -147,17 +236,6 @@ async def _selected_pack_ids(session, user_id: int) -> set[int]:
     return {int(r[0]) for r in res.all()}
 
 
-async def get_packs_and_selected(tg_id: int) -> tuple[list[PackRow], set[int]]:
-    await ensure_user(tg_id)
-    async with session_scope() as session:
-        packs = await _fetch_packs(session)
-        user = (await session.execute(select(User).where(User.tg_id == tg_id))).scalars().first()
-        if not user:
-            return packs, set()
-        selected = await _selected_pack_ids(session, user.id)
-        return packs, selected
-
-
 async def _toggle_pack(session, user_id: int, pack_id: int) -> None:
     _packs_t, user_packs_t, _pack_channels_t = await _resolve_pack_tables(session)
     cols = await _table_cols(session, user_packs_t)
@@ -169,7 +247,6 @@ async def _toggle_pack(session, user_id: int, pack_id: int) -> None:
     if not user_id_col or not pack_id_col:
         raise RuntimeError(f"user_packs table {user_packs_t!r} missing user_id/pack_id; cols={sorted(cols)}")
 
-    # find existing row
     sql_find = (
         f"select {_safe_ident(user_id_col)}, {_safe_ident(pack_id_col)}"
         + (f", {_safe_ident(enabled_col)}" if enabled_col else "")
@@ -192,7 +269,6 @@ async def _toggle_pack(session, user_id: int, pack_id: int) -> None:
             )
             await session.execute(text(sql_upd), {"val": (not cur_enabled), "uid": user_id, "pid": pack_id})
     else:
-        # no enabled column: toggle by insert/delete
         if row is None:
             sql_ins = (
                 f"insert into {_safe_ident(user_packs_t)} ({_safe_ident(user_id_col)}, {_safe_ident(pack_id_col)}) "
@@ -219,7 +295,6 @@ async def _channels_for_pack_ids(session, pack_ids: list[int]) -> list[str]:
     if not pack_id_col or not channel_id_col:
         raise RuntimeError(f"pack_channels table {pack_channels_t!r} missing pack_id/channel_id; cols={sorted(pc_cols)}")
 
-    # channels table is ORM-backed; columns should exist as in MVP
     sql = (
         f"select distinct c.username "
         f"from {_safe_ident(pack_channels_t)} pc "
@@ -232,30 +307,129 @@ async def _channels_for_pack_ids(session, pack_ids: list[int]) -> list[str]:
     return [u.lstrip("@") for u in usernames]
 
 
+async def _render_packs_ui(tg_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    await ensure_user(tg_id)
+    async with session_scope() as session:
+        user = (await session.execute(select(User).where(User.tg_id == tg_id))).scalars().first()
+        if not user:
+            return "Пользователь не найден.", InlineKeyboardMarkup(inline_keyboard=[])
+
+        delivery_enabled, interval_sec, last_sent = await _get_user_settings(session, user.id)
+
+        packs = await _fetch_packs(session)
+        selected = await _selected_pack_ids(session, user.id)
+
+    title = _settings_text(delivery_enabled, interval_sec, last_sent) + "\n\nВыбери паки:"
+    return title, packs_keyboard(packs, selected, delivery_enabled)
+
+
 @dp.message(CommandStart())
 async def start(m: Message):
     logger.info("start tg_id=%s", m.from_user.id)
-    await ensure_user(m.from_user.id)
-    packs, selected = await get_packs_and_selected(m.from_user.id)
-    if not packs:
-        await m.answer("Паки пока не настроены.")
-        return
-    await m.answer("Выбери паки для дайджеста:", reply_markup=packs_keyboard(packs, selected))
+    title, kb = await _render_packs_ui(m.from_user.id)
+    await m.answer(title, reply_markup=kb)
 
 
 @dp.message(Command("packs"))
 async def packs_cmd(m: Message):
     logger.info("packs tg_id=%s", m.from_user.id)
+    title, kb = await _render_packs_ui(m.from_user.id)
+    await m.answer(title, reply_markup=kb)
+
+
+@dp.message(Command("settings"))
+async def settings_cmd(m: Message):
+    logger.info("settings tg_id=%s", m.from_user.id)
     await ensure_user(m.from_user.id)
-    packs, selected = await get_packs_and_selected(m.from_user.id)
-    await m.answer("Твои паки:", reply_markup=packs_keyboard(packs, selected))
+    async with session_scope() as session:
+        user = (await session.execute(select(User).where(User.tg_id == m.from_user.id))).scalars().first()
+        if not user:
+            await m.answer("Пользователь не найден.")
+            return
+        enabled, interval_sec, last_sent = await _get_user_settings(session, user.id)
+    await m.answer(_settings_text(enabled, interval_sec, last_sent), reply_markup=_settings_kb(enabled))
+
+
+@dp.message(Command("interval"))
+async def interval_cmd(m: Message):
+    logger.info("interval tg_id=%s", m.from_user.id)
+    parts = (m.text or "").strip().split()
+    if len(parts) < 2:
+        await m.answer("Использование: /interval 15  (минуты). Чтобы сбросить: /interval 0")
+        return
+    try:
+        minutes = int(parts[1])
+    except Exception:
+        await m.answer("Нужно число минут. Пример: /interval 15")
+        return
+
+    await ensure_user(m.from_user.id)
+    async with session_scope() as session:
+        user = (await session.execute(select(User).where(User.tg_id == m.from_user.id))).scalars().first()
+        if not user:
+            await m.answer("Пользователь не найден.")
+            return
+        await _ensure_user_settings(session)
+        await _ensure_user_settings_row(session, user.id)
+
+        if minutes <= 0:
+            await session.execute(text("update user_settings set digest_interval_sec=null where user_id=:uid"), {"uid": user.id})
+            await session.commit()
+            enabled, interval_sec, last_sent = await _get_user_settings(session, user.id)
+            await m.answer("Интервал сброшен. Теперь используется глобальная настройка.", reply_markup=_settings_kb(enabled))
+            return
+
+        await _set_interval_minutes(session, user.id, minutes)
+        enabled, interval_sec, last_sent = await _get_user_settings(session, user.id)
+        await m.answer(f"Ок. Персональный интервал: {max(interval_sec // 60, 1)} мин", reply_markup=_settings_kb(enabled))
+
+
+@dp.callback_query(F.data == "ui:settings")
+async def ui_settings(cb: CallbackQuery):
+    await ensure_user(cb.from_user.id)
+    async with session_scope() as session:
+        user = (await session.execute(select(User).where(User.tg_id == cb.from_user.id))).scalars().first()
+        if not user:
+            await cb.answer("user not found", show_alert=True)
+            return
+        enabled, interval_sec, last_sent = await _get_user_settings(session, user.id)
+    if cb.message:
+        await cb.message.answer(_settings_text(enabled, interval_sec, last_sent), reply_markup=_settings_kb(enabled))
+    await cb.answer("OK")
+
+
+@dp.callback_query(F.data == "ui:packs")
+async def ui_packs(cb: CallbackQuery):
+    title, kb = await _render_packs_ui(cb.from_user.id)
+    if cb.message:
+        await cb.message.answer(title, reply_markup=kb)
+    await cb.answer("OK")
+
+
+@dp.callback_query(F.data == "delivery:toggle")
+async def delivery_toggle(cb: CallbackQuery):
+    await ensure_user(cb.from_user.id)
+    async with session_scope() as session:
+        user = (await session.execute(select(User).where(User.tg_id == cb.from_user.id))).scalars().first()
+        if not user:
+            await cb.answer("user not found", show_alert=True)
+            return
+        new_val = await _toggle_delivery(session, user.id)
+        enabled, interval_sec, last_sent = await _get_user_settings(session, user.id)
+
+    if cb.message:
+        await cb.message.answer(_settings_text(enabled, interval_sec, last_sent), reply_markup=_settings_kb(new_val))
+    await cb.answer("OK")
 
 
 @dp.callback_query(F.data == "packs:refresh")
 async def packs_refresh(cb: CallbackQuery):
-    logger.info("packs_refresh tg_id=%s", cb.from_user.id)
-    packs, selected = await get_packs_and_selected(cb.from_user.id)
-    await safe_edit_reply_markup(cb, packs_keyboard(packs, selected))
+    title, kb = await _render_packs_ui(cb.from_user.id)
+    if cb.message:
+        try:
+            await cb.message.edit_text(title, reply_markup=kb)
+        except TelegramBadRequest:
+            await safe_edit_reply_markup(cb, kb)
     await cb.answer("OK")
 
 
@@ -272,54 +446,44 @@ async def pack_toggle(cb: CallbackQuery):
             return
         await _toggle_pack(session, user.id, pack_id)
 
-    packs, selected = await get_packs_and_selected(cb.from_user.id)
-    await safe_edit_reply_markup(cb, packs_keyboard(packs, selected))
+    title, kb = await _render_packs_ui(cb.from_user.id)
+    if cb.message:
+        try:
+            await cb.message.edit_text(title, reply_markup=kb)
+        except TelegramBadRequest:
+            await safe_edit_reply_markup(cb, kb)
     await cb.answer("OK")
 
 
-@dp.message(Command("account"))
-async def account(m: Message):
-    logger.info("account tg_id=%s", m.from_user.id)
-    await ensure_user(m.from_user.id)
-    async with session_scope() as session:
-        user = (await session.execute(select(User).where(User.tg_id == m.from_user.id))).scalars().first()
-        if not user:
-            await m.answer("Пользователь не найден.")
-            return
-
-    exp = getattr(user, "subscription_expires_at", None)
-    exp_s = exp.isoformat() if exp else "-"
-    role = getattr(user, "role", "guest")
-    await m.answer(f"Роль: {role}\nПодписка до: {exp_s}\nКоманды: /packs /digest")
+@dp.callback_query(F.data == "ui:digest_now")
+async def ui_digest_now(cb: CallbackQuery):
+    if cb.message:
+        await cb.message.answer("Собираю дайджест…")
+    await cb.answer("OK")
+    await _send_digest_to_user(cb.from_user.id, cb.message)
 
 
-@dp.message(Command("digest"))
-async def digest(m: Message):
-    logger.info("digest tg_id=%s", m.from_user.id)
-    await ensure_user(m.from_user.id)
+async def _send_digest_to_user(tg_id: int, msg_ctx: Message | None) -> None:
+    await ensure_user(tg_id)
     now = datetime.now(timezone.utc)
 
     async with session_scope() as session:
-        user = (await session.execute(select(User).where(User.tg_id == m.from_user.id))).scalars().first()
+        user = (await session.execute(select(User).where(User.tg_id == tg_id))).scalars().first()
         if not user:
-            await m.answer("Пользователь не найден.")
+            if msg_ctx:
+                await msg_ctx.answer("Пользователь не найден.")
             return
 
-        # selected pack ids
-        try:
-            selected = await _selected_pack_ids(session, user.id)
-        except Exception as e:
-            logger.exception("digest selected packs error: %s", e)
-            await m.answer("Схема паков не готова (таблицы packs/user_packs/pack_channels).")
-            return
-
+        selected = await _selected_pack_ids(session, user.id)
         if not selected:
-            await m.answer("Паки не выбраны. Используй /packs.")
+            if msg_ctx:
+                await msg_ctx.answer("Паки не выбраны. Используй /packs.")
             return
 
         channel_refs = await _channels_for_pack_ids(session, list(selected))
         if not channel_refs:
-            await m.answer("Для выбранных паков нет активных каналов.")
+            if msg_ctx:
+                await msg_ctx.answer("Для выбранных паков нет активных каналов.")
             return
 
         posts = (
@@ -336,21 +500,29 @@ async def digest(m: Message):
         ).scalars().all()
 
     if not posts:
-        await m.answer("Нет свежих постов. Harvester ещё не собрал данные или не настроен.")
+        if msg_ctx:
+            await msg_ctx.answer("Нет свежих постов (harvester ещё не собрал новые данные).")
         return
 
-    out = "Дайджест (последние посты):\n\n"
+    out = "Дайджест (ручной):\n\n"
     for p in posts:
         text0 = (p.text or "").strip().replace("\n", " ")
-        if len(text0) > 140:
-            text0 = text0[:140] + "…"
-        url = (p.url or "").strip()
+        if len(text0) > 180:
+            text0 = text0[:180] + "…"
+        url = (p.url or "").strip() or f"https://t.me/{p.channel_ref}/{p.message_id}"
         chunk = f"{p.channel_ref}: {text0}\n{url}\n\n"
         if len(out) + len(chunk) > 3800:
             break
         out += chunk
 
-    await m.answer(out)
+    if msg_ctx:
+        await msg_ctx.answer(out)
+
+
+@dp.message(Command("digest"))
+async def digest_cmd(m: Message):
+    logger.info("digest tg_id=%s", m.from_user.id)
+    await _send_digest_to_user(m.from_user.id, m)
 
 
 async def main() -> None:

@@ -100,6 +100,45 @@ async def _ensure_deliveries_table(session) -> None:
     await session.commit()
 
 
+async def _ensure_user_settings(session) -> None:
+    await session.execute(
+        text(
+            """
+            create table if not exists user_settings (
+              user_id integer primary key,
+              delivery_enabled boolean not null default true,
+              digest_interval_sec integer null,
+              last_sent_at timestamptz null
+            );
+            """
+        )
+    )
+    await session.execute(text("create index if not exists ix_user_settings_delivery_enabled on user_settings(delivery_enabled);"))
+    await session.commit()
+
+
+async def _ensure_user_settings_row(session, user_id: int) -> None:
+    await session.execute(
+        text("insert into user_settings (user_id) values (:uid) on conflict do nothing"),
+        {"uid": user_id},
+    )
+    await session.commit()
+
+
+async def _get_user_settings(session, user_id: int) -> tuple[bool, int | None, datetime | None]:
+    await _ensure_user_settings(session)
+    await _ensure_user_settings_row(session, user_id)
+    row = (
+        await session.execute(
+            text("select delivery_enabled, digest_interval_sec, last_sent_at from user_settings where user_id=:uid"),
+            {"uid": user_id},
+        )
+    ).first()
+    if not row:
+        return True, None, None
+    return bool(row[0]), (int(row[1]) if row[1] is not None else None), row[2]
+
+
 @dataclass(frozen=True)
 class UserRow:
     id: int
@@ -115,8 +154,20 @@ class PostRow:
 
 
 async def _fetch_users(session) -> list[UserRow]:
-    # минимально необходимое: id + tg_id
-    res = await session.execute(text("select id, tg_id from users where tg_id is not null order by id"))
+    # user_settings.delivery_enabled respected
+    await _ensure_user_settings(session)
+    res = await session.execute(
+        text(
+            """
+            select u.id, u.tg_id
+            from users u
+            left join user_settings s on s.user_id = u.id
+            where u.tg_id is not null
+              and coalesce(s.delivery_enabled, true) = true
+            order by u.id
+            """
+        )
+    )
     out: list[UserRow] = []
     for r in res.all():
         out.append(UserRow(id=int(r[0]), tg_id=int(r[1])))
@@ -209,15 +260,23 @@ async def _mark_delivered(session, user_id: int, posts: list[PostRow]) -> None:
     await session.commit()
 
 
+async def _touch_last_sent(session, user_id: int) -> None:
+    await _ensure_user_settings(session)
+    await _ensure_user_settings_row(session, user_id)
+    await session.execute(
+        text("update user_settings set last_sent_at=now() where user_id=:uid"),
+        {"uid": user_id},
+    )
+    await session.commit()
+
+
 def _build_digest(posts: list[PostRow], max_chars: int = 3800) -> str:
     out = "Авто-дайджест:\n\n"
     for p in posts:
         t = (p.text or "").strip().replace("\n", " ")
         if len(t) > 180:
             t = t[:180] + "…"
-        url = (p.url or "").strip()
-        if not url:
-            url = f"https://t.me/{p.channel_ref}/{p.message_id}"
+        url = (p.url or "").strip() or f"https://t.me/{p.channel_ref}/{p.message_id}"
         chunk = f"{p.channel_ref}: {t}\n{url}\n\n"
         if len(out) + len(chunk) > max_chars:
             break
@@ -227,7 +286,7 @@ def _build_digest(posts: list[PostRow], max_chars: int = 3800) -> str:
 
 async def _oneshot() -> None:
     enabled = _env_bool("WORKER_ENABLED", True)
-    dry = _env_bool("WORKER_DRY_RUN", True)
+    dry = _env_bool("WORKER_DRY_RUN", False)
     max_posts = _env_int("WORKER_MAX_POSTS_PER_USER", 10)
     target_tg = os.environ.get("WORKER_TARGET_TG_ID", "").strip()
 
@@ -242,6 +301,7 @@ async def _oneshot() -> None:
 
     async with session_scope() as session:
         await _ensure_deliveries_table(session)
+        await _ensure_user_settings(session)
         user_packs_t, pack_channels_t = await _resolve_pack_tables(session)
         users = await _fetch_users(session)
 
@@ -257,6 +317,16 @@ async def _oneshot() -> None:
         sent_users = 0
         for u in users:
             try:
+                delivery_enabled, interval_sec, last_sent_at = await _get_user_settings(session, u.id)
+                if not delivery_enabled:
+                    continue
+
+                # per-user throttle (если задан)
+                if interval_sec and last_sent_at:
+                    delta = (datetime.now(timezone.utc) - last_sent_at).total_seconds()
+                    if delta < float(interval_sec):
+                        continue
+
                 pack_ids = await _selected_pack_ids(session, u.id, user_packs_t)
                 if not pack_ids:
                     continue
@@ -273,11 +343,13 @@ async def _oneshot() -> None:
                 if dry:
                     logger.info("DRY user_tg=%s posts=%s", u.tg_id, len(posts))
                     await _mark_delivered(session, u.id, posts)
+                    await _touch_last_sent(session, u.id)
                     sent_users += 1
                     continue
 
                 await bot.send_message(u.tg_id, msg)
                 await _mark_delivered(session, u.id, posts)
+                await _touch_last_sent(session, u.id)
                 sent_users += 1
 
                 await asyncio.sleep(0.4)
@@ -290,9 +362,9 @@ async def _oneshot() -> None:
 
 
 async def _loop() -> None:
-    interval = _env_int("WORKER_INTERVAL_SEC", 60)
+    interval = _env_int("WORKER_INTERVAL_SEC", 300)
     if interval <= 0:
-        interval = 60
+        interval = 300
     logger.info("worker loop started interval=%ss", interval)
     while True:
         await _oneshot()
