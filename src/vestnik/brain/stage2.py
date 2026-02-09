@@ -1,17 +1,12 @@
 from __future__ import annotations
-import os
 
 import hashlib
 import json
+import os
+import re
 from datetime import datetime
-from typing import Optional
+from typing import Any
 
-from vestnik.settings import (
-    OPENAI_API_KEY,
-    OPENAI_BASE_URL,
-    AI_MAX_RETRIES,
-    AI_RETRY_SLEEP_SEC,
-)
 from vestnik.brain.openai_http import OpenAIConfig, chat_text
 from vestnik.brain.stage1 import Stage1Item
 
@@ -23,8 +18,57 @@ def _clip_4096(s: str) -> str:
     return s[:4090].rstrip() + "…"
 
 
+def _int_env(name: str, default: int) -> int:
+    v = (os.getenv(name, "") or "").strip()
+    if not v:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def _ai_key() -> str:
+    return (os.getenv("DEEPSEEK_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")).strip()
+
+
+def _ai_base_url() -> str:
+    return (
+        os.getenv("DEEPSEEK_BASE_URL", "").strip()
+        or os.getenv("OPENAI_BASE_URL", "").strip()
+        or "https://api.deepseek.com"
+    )
+
+
+def _mk_cfg() -> OpenAIConfig:
+    api_key = _ai_key()
+    if not api_key:
+        raise RuntimeError("AI API key is empty (set DEEPSEEK_API_KEY or OPENAI_API_KEY)")
+    base_url = _ai_base_url()
+
+    max_retries = _int_env("AI_MAX_RETRIES", 2)
+    retry_sleep_sec = _int_env("AI_RETRY_SLEEP_SEC", 2)
+
+    # OpenAIConfig may differ by version; keep it tolerant.
+    try:
+        return OpenAIConfig(
+            api_key=api_key,
+            base_url=base_url,
+            max_retries=max_retries,
+            retry_sleep_sec=retry_sleep_sec,
+        )
+    except TypeError:
+        return OpenAIConfig(api_key=api_key, base_url=base_url)
+
+
+def _sanitize_line(s: str) -> str:
+    s = (s or "").replace("\r", " ").replace("\n", " ").strip()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def _input_hash(pack_key: str, start: datetime, end: datetime, prompt: str, model: str, items: list[Stage1Item]) -> str:
-    payload = {
+    payload: dict[str, Any] = {
         "pack_key": pack_key,
         "start": start.isoformat(),
         "end": end.isoformat(),
@@ -55,26 +99,23 @@ async def run_stage2(
     end: datetime,
     prompt_text: str,
     items: list[Stage1Item],
-    ) -> tuple[str, str]:
-    if not (os.getenv("DEEPSEEK_API_KEY","") or os.getenv("OPENAI_API_KEY","")):
-        raise RuntimeError("AI API key is empty (set DEEPSEEK_API_KEY or OPENAI_API_KEY)")
-    cfg = OpenAIConfig(
-        api_key=(os.getenv("DEEPSEEK_API_KEY","") or os.getenv("OPENAI_API_KEY","")),
-        base_url=(os.getenv("DEEPSEEK_BASE_URL","") or OPENAI_BASE_URL),
-        max_retries=int(AI_MAX_RETRIES),
-        retry_sleep_sec=int(AI_RETRY_SLEEP_SEC),
-    )
+) -> tuple[str, str]:
+    cfg = _mk_cfg()
 
-    # Keep input compact: stage2 consumes only processed facts, not raw posts.
-    facts = [
-        {
-            "title": i.summary.split(".")[0][:140],
-            "summary": i.summary,
-            "url": i.url,
-            "channel": i.channel_name,
-        }
-        for i in items
-    ]
+    facts = []
+    for i in items:
+        summ = _sanitize_line(i.summary)
+        title = (summ.split(".")[0] if summ else "").strip()
+        if len(title) > 140:
+            title = title[:140].rstrip() + "…"
+        facts.append(
+            {
+                "title": title,
+                "summary": summ,
+                "url": (i.url or "").strip(),
+                "channel": (i.channel_name or "").strip(),
+            }
+        )
 
     system = (
         "Ты — Stage 2 системы «Чистый вестник».\n"
@@ -118,8 +159,8 @@ async def run_stage2(
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        temperature=0.2,
-        max_tokens=1400,
+        temperature=float(os.getenv("AI_STAGE2_TEMPERATURE", "0.2") or "0.2"),
+        max_tokens=_int_env("AI_STAGE2_MAX_TOKENS", 1400),
     )
 
     ih = _input_hash(pack_key, start, end, prompt_text, model, items)

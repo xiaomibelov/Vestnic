@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import asyncio
 import os
 import sys
+
+def _setup_logging() -> None:
+    lvl = (os.getenv("LOG_LEVEL", "INFO") or "INFO").upper()
+    level = getattr(logging, lvl, logging.INFO)
+    logging.basicConfig(level=level, format="%(levelname)s:%(name)s:%(message)s")
+
 
 
 def _int_env(name: str, default: int) -> int:
@@ -36,6 +43,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _setup_logging()
     parser = _build_parser()
     args = parser.parse_args(argv)
 
