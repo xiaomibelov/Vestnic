@@ -57,6 +57,8 @@ class OpenAIConfig:
     api_key: str = ""
     base_url: str = ""
     model: str = ""
+    max_retries: int = 3
+    retry_sleep_sec: int = 2
 
 
 def _resolve_cfg(cfg: Optional[OpenAIConfig]) -> Tuple[str, str, str]:
