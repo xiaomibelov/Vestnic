@@ -47,9 +47,16 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     argv = list(argv)
+    # old style: python -m vestnik.brain mvp_general --hours 24 ...
     if argv and (not str(argv[0]).startswith('-')) and argv[0] not in ('oneshot',):
         argv.insert(0, 'oneshot')
-    _setup_logging()
+    # allow positional pack_key after oneshot: oneshot mvp_general -> oneshot --pack-key mvp_general
+    if argv and argv[0] == 'oneshot':
+        if '--pack-key' not in argv and '-p' not in argv:
+            if len(argv) >= 2 and (not str(argv[1]).startswith('-')):
+                pk = argv[1]
+                argv[1:2] = ['--pack-key', pk]
+
     parser = _build_parser()
     args = parser.parse_args(argv)
 
