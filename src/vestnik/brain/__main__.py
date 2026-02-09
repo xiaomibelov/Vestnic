@@ -64,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if res is None:
-        raise SystemExit("generate_report returned None (see logs above)")
+        raise SystemExit("generate_report returned None (BUG)")
 
     print(res.report_text)
     return 0

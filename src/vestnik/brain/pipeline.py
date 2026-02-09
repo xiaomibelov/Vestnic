@@ -327,14 +327,18 @@ async def generate_report(
             res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, [], prehash, AI_STAGE2_MODEL)
             if save:
                 uid = await _pick_user_id(session, user_tg_id)
-                cached_text = await _load_cached_report(
-                    session,
-                    user_id=uid,
-                    pack_key=pack_key,
-                    start=start,
-                    end=end,
-                    input_hash=prehash,
-                )
+                try:
+                    cached_text = await _load_cached_report(
+                        session,
+                        user_id=uid,
+                        pack_key=pack_key,
+                        start=start,
+                        end=end,
+                        input_hash=prehash,
+                    )
+                except Exception:
+                    log.exception('stage2 cache check failed (unmasked)')
+                    raise
                 if cached_text:
                     log.info("stage2 cache hit: input_hash=%s", prehash)
                     return ReportResult(pack_id, pack_key, pack_title, start, end, cached_text, [], prehash, AI_STAGE2_MODEL)
