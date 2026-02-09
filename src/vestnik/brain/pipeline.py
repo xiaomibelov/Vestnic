@@ -472,4 +472,6 @@ async def generate_report(
 
             if res is None:
                 raise RuntimeError("generate_report produced None (BUG)")
+            if res is None:
+                raise RuntimeError("generate_report produced None (BUG)")
             return res
