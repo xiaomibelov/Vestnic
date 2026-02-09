@@ -191,6 +191,9 @@ async def _reports_columns(session) -> set[str]:
 
 
 async def _pick_user_id(session, user_tg_id: int | None) -> int:
+    # treat 0 as 'unset' tg id (CLI default)
+    if user_tg_id == 0:
+        user_tg_id = None
     if user_tg_id is not None:
         row = (
             await session.execute(
