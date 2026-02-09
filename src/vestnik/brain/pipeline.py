@@ -475,3 +475,8 @@ async def generate_report(
             if res is None:
                 raise RuntimeError("generate_report produced None (BUG)")
             return res
+
+    # guard: never fall through to implicit None
+    if 'res' in locals() and res is not None:
+        return res
+    raise RuntimeError("BUG: generate_report fell through without returning")
