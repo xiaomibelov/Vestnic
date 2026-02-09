@@ -388,7 +388,7 @@ async def generate_report(
             if k in stage1_items:
                 ordered.append(stage1_items[k])
 
-        if len(ordered) < 3:
+        if len(ordered) < 1:
 
             txt = (
 
