@@ -470,4 +470,6 @@ async def generate_report(
 
                 await _save_report(session, user_id=uid, res=res)
 
+            if res is None:
+                raise RuntimeError("generate_report produced None (BUG)")
             return res
