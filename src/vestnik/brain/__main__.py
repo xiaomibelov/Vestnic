@@ -43,6 +43,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # compat: allow python -m vestnik.brain <pack_key> ... as alias for oneshot
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = list(argv)
+    if argv and (not str(argv[0]).startswith('-')) and argv[0] not in ('oneshot',):
+        argv.insert(0, 'oneshot')
     _setup_logging()
     parser = _build_parser()
     args = parser.parse_args(argv)
