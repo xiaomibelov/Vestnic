@@ -38,7 +38,7 @@ def _sha256_text(s: str) -> str:
 def _utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).replace(microsecond=0)
+    return dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
 
 
 async def _load_prompt(session, pack_key: str) -> str:
@@ -293,8 +293,7 @@ async def generate_report(
     if period_end is not None:
         end = _utc(period_end)
     else:
-        end = datetime.now(timezone.utc).replace(microsecond=0)
-
+        end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     if period_start is not None:
         start = _utc(period_start)
     else:
@@ -313,12 +312,32 @@ async def generate_report(
         posts = await _load_posts(session, refs, start, end, int(limit))
         if not posts:
             txt = (
-                f"📅 ЧИСТАЯ СВОДКА: {pack_title}\n"
-                f"За период {start.strftime('%Y-%m-%d %H:%M')}—{end.strftime('%Y-%m-%d %H:%M')} значимых событий не обнаружено.\n"
+                "📅 ЧИСТАЯ СВОДКА: " + str(pack_title) + "\n"
+                + "За период " + start.strftime("%Y-%m-%d %H:%M") + "—" + end.strftime("%Y-%m-%d %H:%M") + " значимых событий не обнаружено.\n"
             )[:4096]
-            res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, [], None, None)
+            payload = {
+                "pack_key": pack_key,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "prompt": prompt_text,
+                "model": AI_STAGE2_MODEL,
+                "items": [],
+            }
+            prehash = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+            res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, [], prehash, AI_STAGE2_MODEL)
             if save:
                 uid = await _pick_user_id(session, user_tg_id)
+                cached_text = await _load_cached_report(
+                    session,
+                    user_id=uid,
+                    pack_key=pack_key,
+                    start=start,
+                    end=end,
+                    input_hash=prehash,
+                )
+                if cached_text:
+                    log.info("stage2 cache hit: input_hash=%s", prehash)
+                    return ReportResult(pack_id, pack_key, pack_title, start, end, cached_text, [], prehash, AI_STAGE2_MODEL)
                 await _save_report(session, user_id=uid, res=res)
             return res
 
@@ -370,64 +389,81 @@ async def generate_report(
                 ordered.append(stage1_items[k])
 
         if len(ordered) < 3:
+
             txt = (
-                f"📅 ЧИСТАЯ СВОДКА: {pack_title}\n"
-                f"За период {start.strftime('%Y-%m-%d %H:%M')}—{end.strftime('%Y-%m-%d %H:%M')} значимых событий не обнаружено.\n"
+
+                "📅 ЧИСТАЯ СВОДКА: " + str(pack_title) + "\n"
+
+                + "За период " + start.strftime("%Y-%m-%d %H:%M") + "—" + end.strftime("%Y-%m-%d %H:%M") + " значимых событий не обнаружено.\n"
+
             )[:4096]
-            res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, ordered, None, None)
+
+            payload = {
+
+                "pack_key": pack_key,
+
+                "start": start.isoformat(),
+
+                "end": end.isoformat(),
+
+                "prompt": prompt_text,
+
+                "model": AI_STAGE2_MODEL,
+
+                "items": [
+
+                    {
+
+                        "channel_ref": i.channel_ref,
+
+                        "message_id": i.message_id,
+
+                        "text_sha256": i.text_sha256,
+
+                        "summary": i.summary,
+
+                        "url": i.url,
+
+                        "channel_name": i.channel_name,
+
+                    }
+
+                    for i in ordered
+
+                ],
+
+            }
+
+            prehash = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+            res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, ordered, prehash, AI_STAGE2_MODEL)
+
             if save:
+
                 uid = await _pick_user_id(session, user_tg_id)
+
+                cached_text = await _load_cached_report(
+
+                    session,
+
+                    user_id=uid,
+
+                    pack_key=pack_key,
+
+                    start=start,
+
+                    end=end,
+
+                    input_hash=prehash,
+
+                )
+
+                if cached_text:
+
+                    log.info("stage2 cache hit: input_hash=%s", prehash)
+
+                    return ReportResult(pack_id, pack_key, pack_title, start, end, cached_text, ordered, prehash, AI_STAGE2_MODEL)
+
                 await _save_report(session, user_id=uid, res=res)
+
             return res
-
-        payload = {
-            "pack_key": pack_key,
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-            "prompt": prompt_text,
-            "model": AI_STAGE2_MODEL,
-            "items": [
-                {
-                    "channel_ref": i.channel_ref,
-                    "message_id": i.message_id,
-                    "text_sha256": i.text_sha256,
-                    "summary": i.summary,
-                    "url": i.url,
-                    "channel_name": i.channel_name,
-                }
-                for i in ordered
-            ],
-        }
-        prehash = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-
-        uid = None
-        if save:
-            uid = await _pick_user_id(session, user_tg_id)
-
-        if save and uid is not None:
-            cached_text = await _load_cached_report(
-                session,
-                user_id=uid,
-                pack_key=pack_key,
-                start=start,
-                end=end,
-                input_hash=prehash,
-            )
-            if cached_text:
-                log.info("stage2 cache hit: input_hash=%s", prehash)
-                return ReportResult(pack_id, pack_key, pack_title, start, end, cached_text, ordered, prehash, AI_STAGE2_MODEL)
-
-        txt, ih = await run_stage2(
-            model=AI_STAGE2_MODEL,
-            pack_key=pack_key,
-            pack_name=pack_title,
-            start=start,
-            end=end,
-            prompt_text=prompt_text,
-            items=ordered,
-        )
-
-        res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, ordered, ih, AI_STAGE2_MODEL)
-        if save and uid is not None:
-            await _save_report(session, user_id=uid, res=res)
-        return res
