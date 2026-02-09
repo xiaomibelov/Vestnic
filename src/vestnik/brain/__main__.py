@@ -2,61 +2,65 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
-from datetime import datetime, timezone
-
-from vestnik.brain.pipeline import generate_report
+import os
+import sys
 
 
-def _parse_dt(s: str) -> datetime:
-    # accept ISO like 2026-02-09T01:02:03+00:00 or Z
-    s = s.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).replace(microsecond=0)
+def _int_env(name: str, default: int) -> int:
+    v = (os.getenv(name, "") or "").strip()
+    if not v:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
 
 
-def build_parser():
-    ap = argparse.ArgumentParser(prog="vestnik.brain")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="python -m vestnik.brain")
+    sp = p.add_subparsers(dest="cmd")
 
-    o = sub.add_parser("oneshot")
-    o.add_argument("--pack-key", required=True)
-    o.add_argument("--hours", type=int, default=24)
-    o.add_argument("--limit", type=int, default=120)
-    o.add_argument("--save", action="store_true")
-    o.add_argument("--user-tg-id", type=int, default=None)
-    o.add_argument("--period-start", default=None, help="ISO datetime (UTC recommended)")
-    o.add_argument("--period-end", default=None, help="ISO datetime (UTC recommended)")
+    oneshot = sp.add_parser("oneshot", help="Generate one report for a pack")
+    oneshot.add_argument("--pack-key", required=True)
+    oneshot.add_argument("--hours", type=int, default=24)
+    oneshot.add_argument("--limit", type=int, default=120)
+    oneshot.add_argument("--save", action="store_true")
+    oneshot.add_argument(
+        "--user-tg-id",
+        type=int,
+        default=_int_env("VESTNIK_USER_TG_ID", 0),
+        help="Telegram user id for report ownership (optional; may be 0)",
+    )
 
-    return ap
+    return p
 
 
-def main():
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
 
-    args = build_parser().parse_args()
+    if args.cmd != "oneshot":
+        parser.print_help()
+        return 2
 
-    if args.cmd == "oneshot":
-        ps = _parse_dt(args.period_start) if args.period_start else None
-        pe = _parse_dt(args.period_end) if args.period_end else None
-        res = asyncio.run(
-            generate_report(
-                pack_key=args.pack_key,
-                hours=args.hours,
-                limit=args.limit,
-                user_tg_id=args.user_tg_id,
-                save=bool(args.save),
-                period_start=ps,
-                period_end=pe,
-            )
+    from vestnik.brain.pipeline import generate_report
+
+    res = asyncio.run(
+        generate_report(
+            user_tg_id=int(args.user_tg_id) if args.user_tg_id is not None else 0,
+            pack_key=str(args.pack_key),
+            hours=int(args.hours),
+            limit=int(args.limit),
+            save=bool(args.save),
         )
-        print(res.report_text)
-        return
+    )
+
+    if res is None:
+        raise SystemExit("generate_report returned None (see logs above)")
+
+    print(res.report_text)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main(sys.argv[1:]))
