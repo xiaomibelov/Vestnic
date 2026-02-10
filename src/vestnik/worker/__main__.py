@@ -387,6 +387,7 @@ def _coerce_dt(v: Any) -> datetime | None:
 
 
 async def _brain_generate_report_compat(
+    import inspect
     session,
     *,
     pack_key: str,
