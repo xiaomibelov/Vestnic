@@ -19,6 +19,58 @@ from vestnik.settings import (
 from vestnik.brain.stage1 import Stage1Item, run_stage1
 from vestnik.brain.stage2 import run_stage2
 
+async def _run_stage2_compat(
+    *,
+    items,
+    model: str,
+    pack_key: str,
+    pack_title: str,
+    period_start,
+    period_end,
+    prompt_text: str,
+) -> str:
+    # Try multiple run_stage2 signatures across revisions.
+    # 1) Older/explicit names
+    try:
+        r = await run_stage2(
+            model=model,
+            pack_key=pack_key,
+            pack_name=pack_title,
+            start=period_start,
+            end=period_end,
+            prompt_text=prompt_text,
+            items=items,
+        )
+        return r[0] if isinstance(r, tuple) and r else (r or "")
+    except TypeError:
+        pass
+
+    # 2) Newer names (prompt_text)
+    try:
+        r = await run_stage2(
+            items=items,
+            prompt_text=prompt_text,
+            model=model,
+            pack_title=pack_title,
+            period_start=period_start,
+            period_end=period_end,
+        )
+        return r[0] if isinstance(r, tuple) and r else (r or "")
+    except TypeError:
+        pass
+
+    # 3) Fallback (prompt)
+    r = await run_stage2(
+        items=items,
+        prompt=prompt_text,
+        model=model,
+        pack_title=pack_title,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    return r[0] if isinstance(r, tuple) and r else (r or "")
+
+
 log = logging.getLogger("vestnik.brain")
 
 
@@ -197,38 +249,48 @@ async def _load_posts(session, refs: list[str], start: datetime, end: datetime, 
 
 
 async def _load_facts(session, keys):
-    # keys: list[(channel_ref, message_id)]
+    # keys: list[(channel_ref, message_id)], where message_id may be int/str.
+    # DB schema: post_facts.message_id is TEXT, so we must query with str mids.
     if not keys:
         return {}
 
-    # DB schema: post_facts.message_id is text -> force str
-    norm = []
-    for ch_ref, msg_id in keys:
-        norm.append((ch_ref, str(msg_id)))
+    refs = sorted({str(ch) for (ch, _) in keys if ch})
+    mids = sorted({str(mid) for (_, mid) in keys if mid is not None and str(mid) != ""})
 
-    stmt = sa.text("""
-        select
-          pf.channel_ref,
-          pf.message_id,
-          pf.text_sha256,
-          pf.summary,
-          pf.model
-        from post_facts pf
-        where (pf.channel_ref, pf.message_id) in :keys
-    """).bindparams(sa.bindparam("keys", expanding=True))
+    if not refs or not mids:
+        return {}
 
-    res = await session.execute(stmt, {"keys": norm})
-    rows = res.fetchall()
+    rows = (
+        await session.execute(
+            text(
+                """
+                select channel_ref, message_id, text_sha256, summary, url, channel_name, model
+                from post_facts
+                where channel_ref = any(:refs)
+                  and message_id = any(:mids)
+                """
+            ),
+            {"refs": refs, "mids": mids},
+        )
+    ).all()
 
     out = {}
-    for r in rows:
-        # r is Row: (channel_ref, message_id, text_sha256, summary, model)
-        out[(r[0], r[1])] = {
-            "text_sha256": r[2],
-            "summary": r[3],
-            "model": r[4],
-        }
+    for ch, mid, tsha, summ, url, cname, model in rows:
+        try:
+            mid_int = int(str(mid))
+        except Exception:
+            continue
+        out[(str(ch), mid_int)] = Stage1Item(
+            channel_ref=str(ch),
+            message_id=mid_int,
+            text_sha256=str(tsha or ""),
+            summary=str(summ or "").strip(),
+            url=str(url or "").strip(),
+            channel_name=str(cname or "").strip(),
+            model=str(model or "").strip(),
+        )
     return out
+
 
 async def _upsert_facts(session, items: list[Stage1Item]) -> None:
     if not items:
@@ -408,7 +470,7 @@ async def generate_report(
             )[:4096]
 
             res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, [], prehash, AI_STAGE2_MODEL)
-            if save and uid is not None:
+            if (save or AI_CACHE_ENABLED) and uid is not None:
                 await _save_report(session, user_id=uid, res=res)
             return res
 
@@ -465,17 +527,18 @@ async def generate_report(
                 + " значимых событий не обнаружено.\n"
             )[:4096]
             res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, ordered, prehash, AI_STAGE2_MODEL)
-            if save and uid is not None:
+            if (save or AI_CACHE_ENABLED) and uid is not None:
                 await _save_report(session, user_id=uid, res=res)
             return res
 
-        report_text = await run_stage2(
+        report_text = await _run_stage2_compat(
             items=ordered,
-            prompt=prompt_text,
             model=AI_STAGE2_MODEL,
+            pack_key=pack_key,
             pack_title=pack_title,
             period_start=start,
             period_end=end,
+            prompt_text=prompt_text,
         )
         if not isinstance(report_text, str):
             report_text = str(report_text or "")
@@ -485,6 +548,6 @@ async def generate_report(
             report_text = report_text[:4096]
 
         res = ReportResult(pack_id, pack_key, pack_title, start, end, report_text, ordered, prehash, AI_STAGE2_MODEL)
-        if save and uid is not None:
+        if (save or AI_CACHE_ENABLED) and uid is not None:
             await _save_report(session, user_id=uid, res=res)
         return res
