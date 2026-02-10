@@ -20,3 +20,5 @@ zip/*.zip
 zip/run_*/
 zip/*.zip
 zip/*.log
+
+zip/

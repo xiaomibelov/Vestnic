@@ -1,24 +1,28 @@
-from __future__ import annotations
-
 import hashlib
 import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any
+import sqlalchemy as sa
 
 from sqlalchemy import text
 
 from vestnik.db import session_scope
 from vestnik.schema import ensure_schema
-from vestnik.settings import AI_ENABLED, AI_CACHE_ENABLED, AI_STAGE1_MODEL, AI_STAGE2_MODEL
-
+from vestnik.settings import (
+    AI_CACHE_ENABLED,
+    AI_ENABLED,
+    AI_STAGE1_MODEL,
+    AI_STAGE2_MODEL,
+)
 from vestnik.brain.stage1 import Stage1Item, run_stage1
 from vestnik.brain.stage2 import run_stage2
 
 log = logging.getLogger("vestnik.brain")
 
 
-@dataclass
+@dataclass(frozen=True)
 class ReportResult:
     pack_id: int
     pack_key: str
@@ -26,257 +30,280 @@ class ReportResult:
     period_start: datetime
     period_end: datetime
     report_text: str
-    sources: list[Stage1Item]
-    input_hash: str | None
-    stage2_model: str | None
+    items: list[Stage1Item]
+    input_hash: str
+    stage2_model: str
 
 
-def _sha256_text(s: str) -> str:
-    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
+def _brain_parse_period_end(period_end: str | None, fallback_end: datetime) -> datetime:
+    if not period_end:
+        return fallback_end.astimezone(timezone.utc)
 
+    s = period_end.strip()
+    if not s:
+        return fallback_end.astimezone(timezone.utc)
 
-def _utc(dt: datetime) -> datetime:
+    dt = datetime.fromisoformat(s)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    return dt.astimezone(timezone.utc)
 
 
-async def _load_prompt(session, pack_key: str) -> str:
-    row = (await session.execute(text("select text from prompts where key=:k limit 1"), {"k": pack_key})).first()
-    if row and str(row[0]).strip():
-        return str(row[0])
-    row = (await session.execute(text("select text from prompts where key='default' limit 1"))).first()
-    if row and str(row[0]).strip():
-        return str(row[0])
-    return (
-        "Формируй стерильную сводку. Запрещено добавлять факты, которых нет в источниках. "
-        "Если данных мало — сокращай вывод без домыслов."
-    )
+def _brain_snap_end(dt: datetime, mode: str | None) -> datetime:
+    m = (mode or "minute").strip().lower()
+    if m in ("none", "no", "off", "0"):
+        return dt
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+
+    if m in ("minute", "min", "1m"):
+        return dt.replace(second=0, microsecond=0)
+
+    if m in ("hour", "h", "1h"):
+        return dt.replace(minute=0, second=0, microsecond=0)
+
+    if m in ("5m", "5min"):
+        snapped_minute = (dt.minute // 5) * 5
+        return dt.replace(minute=snapped_minute, second=0, microsecond=0)
+
+    if m in ("10m", "10min"):
+        snapped_minute = (dt.minute // 10) * 10
+        return dt.replace(minute=snapped_minute, second=0, microsecond=0)
+
+    return dt.replace(second=0, microsecond=0)
 
 
 async def _load_pack(session, pack_key: str) -> tuple[int, str]:
     row = (
         await session.execute(
-            text("select id, title from packs where key=:k and is_active=true limit 1"),
+            text(
+                """
+                select id, title
+                from packs
+                where key = :k
+                limit 1
+                """
+            ),
             {"k": pack_key},
         )
     ).first()
     if not row:
-        raise RuntimeError(f"pack not found or inactive: {pack_key}")
+        raise RuntimeError(f"pack not found: {pack_key}")
     return int(row[0]), str(row[1])
 
 
-async def _load_pack_refs(session, pack_id: int) -> list[str]:
-    refs = (
+def _prompt_key(pack_key: str) -> str:
+    return f"brain:{pack_key}:prompt"
+
+
+async def _load_prompt(session, pack_key: str) -> str:
+    k = _prompt_key(pack_key)
+    row = (
         await session.execute(
             text(
                 """
-                select replace(c.username,'@','') as ref
-                from pack_channels pc
-                join channels c on c.id=pc.channel_id
-                where pc.pack_id=:pid and coalesce(c.is_active,true)=true
+                select text
+                from prompts
+                where key = :k
+                order by id desc
+                limit 1
                 """
             ),
-            {"pid": pack_id},
+            {"k": k},
         )
-    ).scalars().all()
-    return [str(x) for x in refs if x]
+    ).first()
+    if row and row[0]:
+        return str(row[0])
+
+    return (
+        "Ты — редактор новостной сводки. Сделай краткую, ясную и полезную сводку по фактам ниже. "
+        "Не выдумывай. Если фактов нет — скажи, что событий не обнаружено."
+    )
 
 
-async def _load_posts(session, refs: list[str], start: datetime, end: datetime, limit: int) -> list[dict[str, str]]:
+async def _pick_user_id(session, user_tg_id: int | None) -> int:
+    tg_id = None if (user_tg_id is None or int(user_tg_id) == 0) else int(user_tg_id)
+
+    if tg_id is not None:
+        row = (
+            await session.execute(
+                text("select id from users where tg_id = :tg limit 1"),
+                {"tg": tg_id},
+            )
+        ).first()
+        if not row:
+            raise RuntimeError(f"user not found by tg_id={tg_id}")
+        return int(row[0])
+
+    row = (await session.execute(text("select id from users order by id asc limit 1"))).first()
+    if not row:
+        raise RuntimeError("no users found (cannot choose default user)")
+    return int(row[0])
+
+
+async def _load_pack_refs(session, pack_id: int) -> list[str]:
     rows = (
         await session.execute(
             text(
                 """
-                select channel_ref, message_id, url, text
-                from posts_cache
-                where is_deleted=false
-                  and expires_at > :now
-                  and parsed_at between :start and :end
-                  and channel_ref = any(:refs)
-                order by parsed_at desc
+                select replace(c.username, '@', '') as ref
+                from pack_channels pc
+                join channels c on c.id = pc.channel_id
+                where pc.pack_id = :pid
+                order by pc.id asc
+                """
+            ),
+            {"pid": int(pack_id)},
+        )
+    ).all()
+    return [str(r[0]) for r in rows if r and r[0]]
+
+
+async def _load_posts(session, refs: list[str], start: datetime, end: datetime, limit: int) -> list[dict[str, Any]]:
+    now = datetime.now(timezone.utc)
+    rows = (
+        await session.execute(
+            text(
+                """
+                select
+                  p.channel_ref,
+                  p.message_id,
+                  p.parsed_at as posted_at,
+                  p.text,
+                  p.url,
+                  p.channel_ref as channel_name
+                from posts_cache p
+                where p.is_deleted = false
+                  and p.expires_at > :now
+                  and p.channel_ref = any(:refs)
+                  and p.parsed_at >= :start
+                  and p.parsed_at < :end
+                order by p.parsed_at desc
                 limit :lim
                 """
             ),
-            {"now": end, "start": start, "end": end, "refs": list(refs), "lim": int(limit)},
-        )
-    ).all()
-
-    out: list[dict[str, str]] = []
-    for ch_ref, msg_id, url, txt in rows:
-        out.append(
             {
-                "channel_ref": str(ch_ref),
-                "message_id": str(msg_id),
-                "url": str(url or ""),
-                "channel_name": f"@{ch_ref}",
-                "text": str(txt or ""),
-            }
+                "now": now,
+                "refs": refs,
+                "start": start,
+                "end": end,
+                "lim": int(limit),
+            },
         )
-    return out
+    ).mappings().all()
+    return [dict(r) for r in rows]
 
 
-async def _load_facts(session, refs: list[str], message_ids: list[str]) -> dict[tuple[str, str], dict]:
-    if not refs or not message_ids:
+async def _load_facts(session, keys):
+    # keys: list[(channel_ref, message_id)]
+    if not keys:
         return {}
-    rows = (
-        await session.execute(
-            text(
-                """
-                select channel_ref, message_id, text_sha256, summary, url, channel_name, model
-                from post_facts
-                where channel_ref = any(:refs) and message_id = any(:mids)
-                """
-            ),
-            {"refs": list(refs), "mids": list(message_ids)},
-        )
-    ).all()
 
-    m: dict[tuple[str, str], dict] = {}
-    for ch, mid, tsha, summ, url, cname, model in rows:
-        m[(str(ch), str(mid))] = {
-            "text_sha256": str(tsha),
-            "summary": str(summ or ""),
-            "url": str(url or ""),
-            "channel_name": str(cname or ""),
-            "model": str(model or ""),
+    # DB schema: post_facts.message_id is text -> force str
+    norm = []
+    for ch_ref, msg_id in keys:
+        norm.append((ch_ref, str(msg_id)))
+
+    stmt = sa.text("""
+        select
+          pf.channel_ref,
+          pf.message_id,
+          pf.text_sha256,
+          pf.summary,
+          pf.model
+        from post_facts pf
+        where (pf.channel_ref, pf.message_id) in :keys
+    """).bindparams(sa.bindparam("keys", expanding=True))
+
+    res = await session.execute(stmt, {"keys": norm})
+    rows = res.fetchall()
+
+    out = {}
+    for r in rows:
+        # r is Row: (channel_ref, message_id, text_sha256, summary, model)
+        out[(r[0], r[1])] = {
+            "text_sha256": r[2],
+            "summary": r[3],
+            "model": r[4],
         }
-    return m
-
+    return out
 
 async def _upsert_facts(session, items: list[Stage1Item]) -> None:
     if not items:
         return
-    for it in items:
-        await session.execute(
-            text(
-                """
-                insert into post_facts(channel_ref, message_id, text_sha256, summary, url, channel_name, model, updated_at)
-                values (:ch, :mid, :sha, :sum, :url, :cname, :model, now())
-                on conflict(channel_ref, message_id)
-                do update set
-                  text_sha256=excluded.text_sha256,
-                  summary=excluded.summary,
-                  url=excluded.url,
-                  channel_name=excluded.channel_name,
-                  model=excluded.model,
-                  updated_at=now()
-                """
-            ),
+    await session.execute(
+        text(
+            """
+            insert into post_facts (channel_ref, message_id, text_sha256, summary, model, updated_at)
+            values (:ch, :mid, :sha, :sum, :model, :ts)
+            on conflict (channel_ref, message_id)
+            do update set
+              text_sha256 = excluded.text_sha256,
+              summary = excluded.summary,
+              model = excluded.model,
+              updated_at = excluded.updated_at
+            """
+        ),
+        [
             {
                 "ch": it.channel_ref,
-                "mid": it.message_id,
+                "mid": str(it.message_id),
                 "sha": it.text_sha256,
                 "sum": it.summary,
-                "url": it.url,
-                "cname": it.channel_name,
                 "model": it.model,
-            },
-        )
-
-
-async def _reports_columns(session) -> set[str]:
-    cols = (
-        await session.execute(
-            text(
-                """
-                select column_name
-                from information_schema.columns
-                where table_schema='public' and table_name='reports'
-                """
-            )
-        )
-    ).scalars().all()
-    return {str(c) for c in cols}
-
-
-async def _pick_user_id(session, user_tg_id: int | None) -> int:
-    # treat 0 as 'unset' tg id (CLI default)
-    if user_tg_id == 0:
-        user_tg_id = None
-    if user_tg_id is not None:
-        row = (
-            await session.execute(
-                text("select id from users where tg_id=:tg limit 1"),
-                {"tg": int(user_tg_id)},
-            )
-        ).first()
-        if not row:
-            raise RuntimeError(f"user not found by tg_id={user_tg_id}")
-        return int(row[0])
-    row = (await session.execute(text("select id from users order by id limit 1"))).first()
-    if not row:
-        raise RuntimeError("no users in DB")
-    return int(row[0])
+                "ts": datetime.now(timezone.utc),
+            }
+            for it in items
+        ],
+    )
 
 
 async def _load_cached_report(session, *, user_id: int, pack_key: str, start: datetime, end: datetime, input_hash: str) -> str | None:
-    cols = await _reports_columns(session)
-    if "input_hash" not in cols:
-        return None
-    text_col = "report_text" if "report_text" in cols else ("text" if "text" in cols else None)
-    if not text_col:
-        return None
-
-    q = text(f"""
-        select {text_col}
-        from reports
-        where user_id=:uid and pack_key=:pk and period_start=:ps and period_end=:pe and input_hash=:ih
-        order by id desc
-        limit 1
-    """)
     row = (
         await session.execute(
-            q,
-            {"uid": user_id, "pk": pack_key, "ps": start, "pe": end, "ih": input_hash},
+            text(
+                """
+                select report_text
+                from reports
+                where user_id = :uid
+                  and pack_key = :pk
+                  and period_start = :ps
+                  and period_end = :pe
+                  and input_hash = :ih
+                order by id desc
+                limit 1
+                """
+            ),
+            {"uid": int(user_id), "pk": pack_key, "ps": start, "pe": end, "ih": input_hash},
         )
     ).first()
-    return str(row[0]) if row and row[0] else None
+    if row and row[0]:
+        return str(row[0])
+    return None
 
 
 async def _save_report(session, *, user_id: int, res: ReportResult) -> None:
-    cols = await _reports_columns(session)
-
-    sources_json = json.dumps(
-        [{"summary": i.summary, "url": i.url, "channel_name": i.channel_name} for i in res.sources],
-        ensure_ascii=False,
+    await session.execute(
+        text(
+            """
+            insert into reports (user_id, pack_id, pack_key, period_start, period_end, report_text, input_hash, stage2_model, created_at)
+            values (:uid, :pid, :pk, :ps, :pe, :txt, :ih, :m, :ts)
+            """
+        ),
+        {
+            "uid": int(user_id),
+            "pid": int(res.pack_id),
+            "pk": res.pack_key,
+            "ps": res.period_start,
+            "pe": res.period_end,
+            "txt": res.report_text,
+            "ih": res.input_hash,
+            "m": res.stage2_model,
+            "ts": datetime.now(timezone.utc),
+        },
     )
-
-    values: dict[str, object] = {
-        "user_id": int(user_id),
-        "pack_id": int(res.pack_id),
-        "pack_key": str(res.pack_key),
-        "period_start": res.period_start,
-        "period_end": res.period_end,
-        "sources_json": sources_json,
-        "report_text": res.report_text,
-        "input_hash": res.input_hash,
-        "stage2_model": res.stage2_model,
-        "stage1_count": len(res.sources),
-    }
-
-    insert_cols = []
-    params = {}
-    for k, v in values.items():
-        if k in cols:
-            insert_cols.append(k)
-            params[k] = v
-
-    if "report_text" not in cols and "text" in cols:
-        params["text"] = res.report_text
-        insert_cols.append("text")
-
-    if "sources_json" not in cols and "sources" in cols:
-        params["sources"] = sources_json
-        insert_cols.append("sources")
-
-    if not insert_cols:
-        raise RuntimeError("reports: no compatible columns to insert")
-
-    cols_sql = ", ".join(insert_cols)
-    ph_sql = ", ".join([f":{c}" for c in insert_cols])
-
-    await session.execute(text(f"insert into reports ({cols_sql}) values ({ph_sql})"), params)
     await session.commit()
 
 
@@ -288,10 +315,36 @@ async def generate_report(
     user_tg_id: int | None = None,
     save: bool = False,
     period_start: datetime | None = None,
-    period_end: datetime | None = None,
+    period_end: str | None = None,
+    snap: str | None = "minute",
 ) -> ReportResult:
-    end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    start = (end - timedelta(hours=int(hours))).replace(second=0, microsecond=0)
+    if not AI_ENABLED:
+        raise RuntimeError("AI is disabled (AI_ENABLED=false)")
+
+    now_utc = datetime.now(timezone.utc)
+    end = _brain_parse_period_end(period_end, now_utc)
+    end = _brain_snap_end(end, snap)
+
+    if period_start is not None:
+        ps = period_start
+        if ps.tzinfo is None:
+            ps = ps.replace(tzinfo=timezone.utc)
+        start = ps.astimezone(timezone.utc)
+    else:
+        start = end - timedelta(hours=int(hours))
+
+    if (snap or "minute") != "none":
+        start = start.replace(second=0, microsecond=0)
+        end = end.replace(second=0, microsecond=0)
+
+    log.info(
+        "report window: pack=%s start=%s end=%s snap=%s hours=%s",
+        pack_key,
+        start.isoformat(),
+        end.isoformat(),
+        (snap or "minute"),
+        hours,
+    )
 
     async with session_scope() as session:
         await ensure_schema(session)
@@ -300,14 +353,15 @@ async def generate_report(
         prompt_text = await _load_prompt(session, pack_key)
 
         refs = await _load_pack_refs(session, pack_id)
-        if not refs:
-            raise RuntimeError(f"pack has no channels: {pack_key}")
-
-        posts = await _load_posts(session, refs, start, end, int(limit))
 
         uid = None
-        if save:
-            uid = await _pick_user_id(session, user_tg_id)
+        if save or AI_CACHE_ENABLED:
+            try:
+                uid = await _pick_user_id(session, user_tg_id)
+            except Exception:
+                if save:
+                    raise
+                uid = None
 
         def _prehash(items: list[Stage1Item]) -> str:
             payload = {
@@ -318,72 +372,66 @@ async def generate_report(
                 "model": AI_STAGE2_MODEL,
                 "items": [
                     {
-                        "channel_ref": i.channel_ref,
-                        "message_id": i.message_id,
-                        "text_sha256": i.text_sha256,
-                        "summary": i.summary,
-                        "url": i.url,
-                        "channel_name": i.channel_name,
+                        "channel_ref": it.channel_ref,
+                        "message_id": it.message_id,
+                        "text_sha256": it.text_sha256,
+                        "summary": it.summary,
+                        "model": it.model,
                     }
-                    for i in items
+                    for it in items
                 ],
             }
             raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
             return hashlib.sha256(raw).hexdigest()
 
-        # no posts: deterministic summary + idempotent cache by input_hash
+        posts = await _load_posts(session, refs, start, end, int(limit))
+
         if not posts:
-            ordered: list[Stage1Item] = []
-            prehash = _prehash(ordered)
-            if save and uid is not None:
-                cached_text = await _load_cached_report(session, user_id=uid, pack_key=pack_key, start=start, end=end, input_hash=prehash)
+            prehash = _prehash([])
+            if AI_CACHE_ENABLED and uid is not None:
+                cached_text = await _load_cached_report(
+                    session,
+                    user_id=uid,
+                    pack_key=pack_key,
+                    start=start,
+                    end=end,
+                    input_hash=prehash,
+                )
                 if cached_text:
                     log.info("stage2 cache hit: input_hash=%s", prehash)
-                    return ReportResult(pack_id, pack_key, pack_title, start, end, cached_text, ordered, prehash, AI_STAGE2_MODEL)
+                    return ReportResult(pack_id, pack_key, pack_title, start, end, cached_text, [], prehash, AI_STAGE2_MODEL)
+
             txt = (
                 "📅 ЧИСТАЯ СВОДКА: " + str(pack_title) + "\n"
-                + "За период " + start.strftime("%Y-%m-%d %H:%M") + "—" + end.strftime("%Y-%m-%d %H:%M") + " значимых событий не обнаружено.\n"
+                + "За период " + start.strftime("%Y-%m-%d %H:%M") + "—" + end.strftime("%Y-%m-%d %H:%M")
+                + " значимых событий не обнаружено.\n"
             )[:4096]
-            res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, ordered, prehash, AI_STAGE2_MODEL)
+
+            res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, [], prehash, AI_STAGE2_MODEL)
             if save and uid is not None:
                 await _save_report(session, user_id=uid, res=res)
             return res
 
-        for p in posts:
-            p["text_sha256"] = _sha256_text(p.get("text", ""))
+        keys = [(str(p["channel_ref"]), int(p["message_id"])) for p in posts]
+        stage1_items = await _load_facts(session, keys)
 
-        mids = list({p["message_id"] for p in posts if p.get("message_id")})
-        facts_map = {}
+        to_process: list[dict[str, Any]] = []
         cached = 0
-        to_process: list[dict[str, str]] = []
-
-        if AI_CACHE_ENABLED:
-            facts_map = await _load_facts(session, refs, mids)
-
-        stage1_items: dict[tuple[str, str], Stage1Item] = {}
 
         for p in posts:
-            key = (p["channel_ref"], p["message_id"])
-            tsha = p["text_sha256"]
-            if AI_CACHE_ENABLED and key in facts_map and facts_map[key].get("text_sha256") == tsha and facts_map[key].get("summary"):
-                f = facts_map[key]
+            k = (str(p["channel_ref"]), int(p["message_id"]))
+            if k in stage1_items and stage1_items[k].summary:
                 cached += 1
-                stage1_items[key] = Stage1Item(
-                    channel_ref=p["channel_ref"],
-                    message_id=p["message_id"],
-                    text_sha256=tsha,
-                    summary=str(f.get("summary", "")).strip(),
-                    url=str(f.get("url", p.get("url", ""))).strip(),
-                    channel_name=str(f.get("channel_name", p.get("channel_name", ""))).strip() or p.get("channel_name", ""),
-                    model=str(f.get("model", "")),
-                )
-            else:
-                to_process.append(p)
+                continue
+            to_process.append(p)
 
         log.info("stage1 cache: cached=%s need_process=%s total_posts=%s", cached, len(to_process), len(posts))
 
         if to_process:
-            new_items = await run_stage1(model=AI_STAGE1_MODEL, posts=to_process)
+            if not AI_CACHE_ENABLED:
+                stage1_items = {}
+
+            new_items = await run_stage1(posts=to_process, model=AI_STAGE1_MODEL)
             await _upsert_facts(session, new_items)
             await session.commit()
             for it in new_items:
@@ -391,40 +439,52 @@ async def generate_report(
 
         ordered: list[Stage1Item] = []
         for p in posts:
-            k = (p["channel_ref"], p["message_id"])
+            k = (str(p["channel_ref"]), int(p["message_id"]))
             if k in stage1_items:
                 ordered.append(stage1_items[k])
 
         prehash = _prehash(ordered)
 
-        if save and uid is not None:
-            cached_text = await _load_cached_report(session, user_id=uid, pack_key=pack_key, start=start, end=end, input_hash=prehash)
+        if AI_CACHE_ENABLED and uid is not None:
+            cached_text = await _load_cached_report(
+                session,
+                user_id=uid,
+                pack_key=pack_key,
+                start=start,
+                end=end,
+                input_hash=prehash,
+            )
             if cached_text:
                 log.info("stage2 cache hit: input_hash=%s", prehash)
                 return ReportResult(pack_id, pack_key, pack_title, start, end, cached_text, ordered, prehash, AI_STAGE2_MODEL)
 
-        # stage2 runs for >=1 fact
         if len(ordered) < 1:
             txt = (
                 "📅 ЧИСТАЯ СВОДКА: " + str(pack_title) + "\n"
-                + "За период " + start.strftime("%Y-%m-%d %H:%M") + "—" + end.strftime("%Y-%m-%d %H:%M") + " значимых событий не обнаружено.\n"
+                + "За период " + start.strftime("%Y-%m-%d %H:%M") + "—" + end.strftime("%Y-%m-%d %H:%M")
+                + " значимых событий не обнаружено.\n"
             )[:4096]
             res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, ordered, prehash, AI_STAGE2_MODEL)
             if save and uid is not None:
                 await _save_report(session, user_id=uid, res=res)
             return res
 
-        txt, ih = await run_stage2(
-            model=AI_STAGE2_MODEL,
-            pack_key=pack_key,
-            pack_name=pack_title,
-            start=start,
-            end=end,
-            prompt_text=prompt_text,
+        report_text = await run_stage2(
             items=ordered,
+            prompt=prompt_text,
+            model=AI_STAGE2_MODEL,
+            pack_title=pack_title,
+            period_start=start,
+            period_end=end,
         )
+        if not isinstance(report_text, str):
+            report_text = str(report_text or "")
 
-        res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, ordered, ih, AI_STAGE2_MODEL)
+        report_text = report_text.strip()
+        if len(report_text) > 4096:
+            report_text = report_text[:4096]
+
+        res = ReportResult(pack_id, pack_key, pack_title, start, end, report_text, ordered, prehash, AI_STAGE2_MODEL)
         if save and uid is not None:
             await _save_report(session, user_id=uid, res=res)
         return res
