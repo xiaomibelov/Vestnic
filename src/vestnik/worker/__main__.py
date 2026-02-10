@@ -387,7 +387,6 @@ def _coerce_dt(v: Any) -> datetime | None:
 
 
 async def _brain_generate_report_compat(
-    import inspect
     session,
     *,
     pack_key: str,
@@ -449,13 +448,11 @@ async def _brain_generate_report_compat(
 
     sig = None
     try:
-        import inspect
         sig = inspect.signature(fn)
     except Exception:
         sig = None
 
     if sig is not None:
-        import inspect
         params = list(sig.parameters.values())
         accepts_positional = any(
             p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
