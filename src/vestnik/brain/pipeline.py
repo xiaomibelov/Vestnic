@@ -19,6 +19,58 @@ from vestnik.settings import (
 from vestnik.brain.stage1 import Stage1Item, run_stage1
 from vestnik.brain.stage2 import run_stage2
 
+async def _run_stage2_compat(
+    *,
+    items,
+    model: str,
+    pack_key: str,
+    pack_title: str,
+    period_start,
+    period_end,
+    prompt_text: str,
+) -> str:
+    # Try multiple run_stage2 signatures across revisions.
+    # 1) Older/explicit names
+    try:
+        r = await run_stage2(
+            model=model,
+            pack_key=pack_key,
+            pack_name=pack_title,
+            start=period_start,
+            end=period_end,
+            prompt_text=prompt_text,
+            items=items,
+        )
+        return r[0] if isinstance(r, tuple) and r else (r or "")
+    except TypeError:
+        pass
+
+    # 2) Newer names (prompt_text)
+    try:
+        r = await run_stage2(
+            items=items,
+            prompt_text=prompt_text,
+            model=model,
+            pack_title=pack_title,
+            period_start=period_start,
+            period_end=period_end,
+        )
+        return r[0] if isinstance(r, tuple) and r else (r or "")
+    except TypeError:
+        pass
+
+    # 3) Fallback (prompt)
+    r = await run_stage2(
+        items=items,
+        prompt=prompt_text,
+        model=model,
+        pack_title=pack_title,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    return r[0] if isinstance(r, tuple) and r else (r or "")
+
+
 log = logging.getLogger("vestnik.brain")
 
 
@@ -418,7 +470,7 @@ async def generate_report(
             )[:4096]
 
             res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, [], prehash, AI_STAGE2_MODEL)
-            if save and uid is not None:
+            if (save or AI_CACHE_ENABLED) and uid is not None:
                 await _save_report(session, user_id=uid, res=res)
             return res
 
@@ -475,17 +527,18 @@ async def generate_report(
                 + " значимых событий не обнаружено.\n"
             )[:4096]
             res = ReportResult(pack_id, pack_key, pack_title, start, end, txt, ordered, prehash, AI_STAGE2_MODEL)
-            if save and uid is not None:
+            if (save or AI_CACHE_ENABLED) and uid is not None:
                 await _save_report(session, user_id=uid, res=res)
             return res
 
-        report_text = await run_stage2(
+        report_text = await _run_stage2_compat(
             items=ordered,
-            prompt=prompt_text,
             model=AI_STAGE2_MODEL,
+            pack_key=pack_key,
             pack_title=pack_title,
             period_start=start,
             period_end=end,
+            prompt_text=prompt_text,
         )
         if not isinstance(report_text, str):
             report_text = str(report_text or "")
@@ -495,6 +548,6 @@ async def generate_report(
             report_text = report_text[:4096]
 
         res = ReportResult(pack_id, pack_key, pack_title, start, end, report_text, ordered, prehash, AI_STAGE2_MODEL)
-        if save and uid is not None:
+        if (save or AI_CACHE_ENABLED) and uid is not None:
             await _save_report(session, user_id=uid, res=res)
         return res
