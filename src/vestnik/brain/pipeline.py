@@ -197,38 +197,48 @@ async def _load_posts(session, refs: list[str], start: datetime, end: datetime, 
 
 
 async def _load_facts(session, keys):
-    # keys: list[(channel_ref, message_id)]
+    # keys: list[(channel_ref, message_id)], where message_id may be int/str.
+    # DB schema: post_facts.message_id is TEXT, so we must query with str mids.
     if not keys:
         return {}
 
-    # DB schema: post_facts.message_id is text -> force str
-    norm = []
-    for ch_ref, msg_id in keys:
-        norm.append((ch_ref, str(msg_id)))
+    refs = sorted({str(ch) for (ch, _) in keys if ch})
+    mids = sorted({str(mid) for (_, mid) in keys if mid is not None and str(mid) != ""})
 
-    stmt = sa.text("""
-        select
-          pf.channel_ref,
-          pf.message_id,
-          pf.text_sha256,
-          pf.summary,
-          pf.model
-        from post_facts pf
-        where (pf.channel_ref, pf.message_id) in :keys
-    """).bindparams(sa.bindparam("keys", expanding=True))
+    if not refs or not mids:
+        return {}
 
-    res = await session.execute(stmt, {"keys": norm})
-    rows = res.fetchall()
+    rows = (
+        await session.execute(
+            text(
+                """
+                select channel_ref, message_id, text_sha256, summary, url, channel_name, model
+                from post_facts
+                where channel_ref = any(:refs)
+                  and message_id = any(:mids)
+                """
+            ),
+            {"refs": refs, "mids": mids},
+        )
+    ).all()
 
     out = {}
-    for r in rows:
-        # r is Row: (channel_ref, message_id, text_sha256, summary, model)
-        out[(r[0], r[1])] = {
-            "text_sha256": r[2],
-            "summary": r[3],
-            "model": r[4],
-        }
+    for ch, mid, tsha, summ, url, cname, model in rows:
+        try:
+            mid_int = int(str(mid))
+        except Exception:
+            continue
+        out[(str(ch), mid_int)] = Stage1Item(
+            channel_ref=str(ch),
+            message_id=mid_int,
+            text_sha256=str(tsha or ""),
+            summary=str(summ or "").strip(),
+            url=str(url or "").strip(),
+            channel_name=str(cname or "").strip(),
+            model=str(model or "").strip(),
+        )
     return out
+
 
 async def _upsert_facts(session, items: list[Stage1Item]) -> None:
     if not items:
