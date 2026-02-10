@@ -1,9 +1,432 @@
-import time
+import asyncio
+import logging
+import os
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
-def main():
-    print("worker: started (stub)")
+from aiogram import Bot
+from sqlalchemy import text
+
+from vestnik.db import session_scope
+from vestnik.schema import ensure_schema
+from vestnik.settings import BOT_TOKEN
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("vestnik.worker")
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name, "").strip()
+    if not v:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name, "").strip().lower()
+    if not v:
+        return default
+    return v in {"1", "true", "yes", "y", "on"}
+
+
+def _safe_ident(name: str) -> str:
+    if not re.fullmatch(r"[a-zA-Z0-9_]+", name or ""):
+        raise ValueError(f"unsafe identifier: {name!r}")
+    return name
+
+
+async def _list_tables(session) -> set[str]:
+    q = text(
+        "select table_name from information_schema.tables "
+        "where table_schema='public' and table_type='BASE TABLE'"
+    )
+    res = await session.execute(q)
+    return {r[0] for r in res.all()}
+
+
+async def _table_cols(session, table: str) -> set[str]:
+    q = text(
+        "select column_name from information_schema.columns "
+        "where table_schema='public' and table_name=:t"
+    )
+    res = await session.execute(q, {"t": table})
+    return {r[0] for r in res.all()}
+
+
+def _pick_table(tables: set[str], candidates: list[str]) -> str | None:
+    for t in candidates:
+        if t in tables:
+            return t
+    return None
+
+
+async def _resolve_pack_tables(session) -> tuple[str, str]:
+    tables = await _list_tables(session)
+
+    user_packs_t = _pick_table(tables, ["user_packs", "user_pack", "users_packs"])
+    pack_channels_t = _pick_table(tables, ["pack_channels", "pack_channel", "packs_channels"])
+
+    missing = []
+    if user_packs_t is None:
+        missing.append("user_packs")
+    if pack_channels_t is None:
+        missing.append("pack_channels")
+
+    if missing:
+        raise RuntimeError(f"missing tables: {missing}. existing={sorted(tables)}")
+
+    return user_packs_t, pack_channels_t
+
+
+async def _ensure_deliveries_table(session) -> None:
+    await session.execute(
+        text(
+            """
+            create table if not exists deliveries (
+              id serial primary key,
+              user_id integer not null,
+              channel_ref varchar(255) not null,
+              message_id varchar(64) not null,
+              sent_at timestamptz not null default now(),
+              unique (user_id, channel_ref, message_id)
+            );
+            """
+        )
+    )
+    await session.execute(text("create index if not exists ix_deliveries_user_id on deliveries(user_id);"))
+    await session.commit()
+
+
+async def _ensure_user_settings(session) -> None:
+    await session.execute(
+        text(
+            """
+            create table if not exists user_settings (
+              user_id integer primary key,
+              delivery_enabled boolean not null default true,
+              digest_interval_sec integer null,
+              last_sent_at timestamptz null,
+              pause_until timestamptz null,
+              format_mode varchar(16) not null default 'digest'
+            );
+            """
+        )
+    )
+    await session.execute(text("alter table user_settings add column if not exists pause_until timestamptz;"))
+    await session.execute(text("alter table user_settings add column if not exists format_mode varchar(16);"))
+    await session.execute(text("update user_settings set format_mode='digest' where format_mode is null;"))
+    await session.execute(text("create index if not exists ix_user_settings_delivery_enabled on user_settings(delivery_enabled);"))
+    await session.execute(text("create index if not exists ix_user_settings_pause_until on user_settings(pause_until);"))
+    await session.commit()
+
+
+async def _ensure_user_settings_row(session, user_id: int) -> None:
+    await session.execute(
+        text("insert into user_settings (user_id) values (:uid) on conflict do nothing"),
+        {"uid": user_id},
+    )
+    await session.commit()
+
+
+async def _get_user_settings(session, user_id: int) -> tuple[bool, int | None, datetime | None, datetime | None, str]:
+    await _ensure_user_settings(session)
+    await _ensure_user_settings_row(session, user_id)
+    row = (
+        await session.execute(
+            text("select delivery_enabled, digest_interval_sec, last_sent_at, pause_until, format_mode from user_settings where user_id=:uid"),
+            {"uid": user_id},
+        )
+    ).first()
+    if not row:
+        return True, None, None, None, "digest"
+    return bool(row[0]), (int(row[1]) if row[1] is not None else None), row[2], row[3], (str(row[4]) if row[4] else "digest")
+
+
+@dataclass(frozen=True)
+class UserRow:
+    id: int
+    tg_id: int
+
+
+@dataclass(frozen=True)
+class PostRow:
+    channel_ref: str
+    message_id: str
+    text: str
+    url: str
+
+
+async def _fetch_users(session) -> list[UserRow]:
+    await _ensure_user_settings(session)
+    now = datetime.now(timezone.utc)
+    res = await session.execute(
+        text(
+            """
+            select u.id, u.tg_id
+            from users u
+            left join user_settings s on s.user_id = u.id
+            where u.tg_id is not null
+              and coalesce(s.delivery_enabled, true) = true
+              and (s.pause_until is null or s.pause_until <= :now)
+            order by u.id
+            """
+        ),
+        {"now": now},
+    )
+    out: list[UserRow] = []
+    for r in res.all():
+        out.append(UserRow(id=int(r[0]), tg_id=int(r[1])))
+    return out
+
+
+async def _selected_pack_ids(session, user_id: int, user_packs_t: str) -> list[int]:
+    cols = await _table_cols(session, user_packs_t)
+
+    user_id_col = "user_id" if "user_id" in cols else None
+    pack_id_col = "pack_id" if "pack_id" in cols else None
+    enabled_col = "is_enabled" if "is_enabled" in cols else ("enabled" if "enabled" in cols else None)
+
+    if not user_id_col or not pack_id_col:
+        raise RuntimeError(f"user_packs table {user_packs_t!r} missing user_id/pack_id; cols={sorted(cols)}")
+
+    where = f"where {_safe_ident(user_id_col)} = :uid"
+    if enabled_col:
+        where += f" and {_safe_ident(enabled_col)} = true"
+
+    sql = f"select {_safe_ident(pack_id_col)} from {_safe_ident(user_packs_t)} {where}"
+    res = await session.execute(text(sql), {"uid": user_id})
+    return [int(r[0]) for r in res.all()]
+
+
+async def _channels_for_pack_ids(session, pack_ids: list[int], pack_channels_t: str) -> list[str]:
+    if not pack_ids:
+        return []
+    cols = await _table_cols(session, pack_channels_t)
+
+    pack_id_col = "pack_id" if "pack_id" in cols else None
+    channel_id_col = "channel_id" if "channel_id" in cols else None
+    if not pack_id_col or not channel_id_col:
+        raise RuntimeError(f"pack_channels table {pack_channels_t!r} missing pack_id/channel_id; cols={sorted(cols)}")
+
+    sql = (
+        f"select distinct c.username "
+        f"from {_safe_ident(pack_channels_t)} pc "
+        f"join channels c on c.id = pc.{_safe_ident(channel_id_col)} "
+        f"where pc.{_safe_ident(pack_id_col)} = any(:pids) "
+        f"and c.is_active = true"
+    )
+    res = await session.execute(text(sql), {"pids": pack_ids})
+    usernames = [str(r[0]) for r in res.all()]
+    return [u.lstrip("@") for u in usernames]
+
+
+async def _fetch_unsent_posts(session, user_id: int, channel_refs: list[str], limit: int) -> list[PostRow]:
+    if not channel_refs:
+        return []
+    now = datetime.now(timezone.utc)
+
+    sql = text(
+        """
+        select p.channel_ref, p.message_id, p.text, p.url
+        from posts_cache p
+        left join deliveries d
+          on d.user_id = :uid
+         and d.channel_ref = p.channel_ref
+         and d.message_id = p.message_id
+        where d.id is null
+          and p.is_deleted = false
+          and p.expires_at > :now
+          and p.channel_ref = any(:refs)
+        order by p.parsed_at desc
+        limit :lim
+        """
+    )
+    res = await session.execute(sql, {"uid": user_id, "now": now, "refs": channel_refs, "lim": limit})
+    out: list[PostRow] = []
+    for r in res.all():
+        out.append(PostRow(channel_ref=str(r[0]), message_id=str(r[1]), text=str(r[2] or ""), url=str(r[3] or "")))
+    return out
+
+
+async def _mark_delivered(session, user_id: int, posts: list[PostRow]) -> None:
+    if not posts:
+        return
+    rows = [{"uid": user_id, "cr": p.channel_ref, "mid": p.message_id} for p in posts]
+    await session.execute(
+        text(
+            """
+            insert into deliveries (user_id, channel_ref, message_id)
+            values (:uid, :cr, :mid)
+            on conflict do nothing
+            """
+        ),
+        rows,
+    )
+    await session.commit()
+
+
+async def _touch_last_sent(session, user_id: int) -> None:
+    await _ensure_user_settings(session)
+    await _ensure_user_settings_row(session, user_id)
+    await session.execute(
+        text("update user_settings set last_sent_at=now() where user_id=:uid"),
+        {"uid": user_id},
+    )
+    await session.commit()
+
+
+def _build_message(posts: list[PostRow], mode: str, max_chars: int = 3800) -> str:
+    mode = (mode or "digest").strip().lower()
+    if mode == "compact":
+        out = "Лента (компакт):\n\n"
+        for p in posts:
+            t = (p.text or "").strip().replace("\n", " ")
+            if len(t) > 120:
+                t = t[:120] + "…"
+            url = (p.url or "").strip() or f"https://t.me/{p.channel_ref}/{p.message_id}"
+            chunk = f"• @{p.channel_ref}: {t}\n{url}\n\n"
+            if len(out) + len(chunk) > max_chars:
+                break
+            out += chunk
+        return out.strip()
+
+    out = "Авто-дайджест:\n\n"
+    for p in posts:
+        t = (p.text or "").strip().replace("\n", " ")
+        if len(t) > 180:
+            t = t[:180] + "…"
+        url = (p.url or "").strip() or f"https://t.me/{p.channel_ref}/{p.message_id}"
+        chunk = f"@{p.channel_ref}: {t}\n{url}\n\n"
+        if len(out) + len(chunk) > max_chars:
+            break
+        out += chunk
+    return out.strip()
+
+
+def _dry_preview_lines(posts: list[PostRow], n: int) -> str:
+    if n <= 0:
+        return ""
+    lines: list[str] = []
+    for p in posts[:n]:
+        url = (p.url or "").strip() or f"https://t.me/{p.channel_ref}/{p.message_id}"
+        lines.append(f"@{p.channel_ref}/{p.message_id} {url}")
+    return " | ".join(lines)
+
+
+async def _oneshot() -> None:
+    enabled = _env_bool("WORKER_ENABLED", True)
+    dry = _env_bool("WORKER_DRY_RUN", False)
+    max_posts = _env_int("WORKER_MAX_POSTS_PER_USER", 10)
+
+    async with session_scope() as session:
+        await ensure_schema(session)
+
+    target_tg = os.environ.get("WORKER_TARGET_TG_ID", "").strip()
+    preview_n = _env_int("WORKER_DRY_RUN_PREVIEW_N", 0)
+
+    if not enabled:
+        logger.warning("WORKER_ENABLED=0; idle")
+        return
+
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN is required")
+
+    bot = Bot(token=BOT_TOKEN)
+
+    async with session_scope() as session:
+        await _ensure_deliveries_table(session)
+        await _ensure_user_settings(session)
+        user_packs_t, pack_channels_t = await _resolve_pack_tables(session)
+        users = await _fetch_users(session)
+
+        if target_tg:
+            try:
+                tg = int(target_tg)
+                users = [u for u in users if u.tg_id == tg]
+            except Exception:
+                logger.warning("WORKER_TARGET_TG_ID invalid: %s", target_tg)
+
+        logger.info("oneshot: users=%s dry_run=%s max_posts=%s preview_n=%s", len(users), dry, max_posts, preview_n)
+
+        sent_users = 0
+        for u in users:
+            try:
+                delivery_enabled, interval_sec, last_sent_at, pause_until, format_mode = await _get_user_settings(session, u.id)
+                if not delivery_enabled:
+                    continue
+
+                if pause_until:
+                    try:
+                        pu = pause_until
+                        if pu.tzinfo is None:
+                            pu = pu.replace(tzinfo=timezone.utc)
+                        if pu > datetime.now(timezone.utc):
+                            continue
+                    except Exception:
+                        pass
+
+                if interval_sec and last_sent_at:
+                    delta = (datetime.now(timezone.utc) - last_sent_at).total_seconds()
+                    if delta < float(interval_sec):
+                        continue
+
+                pack_ids = await _selected_pack_ids(session, u.id, user_packs_t)
+                if not pack_ids:
+                    continue
+                channel_refs = await _channels_for_pack_ids(session, pack_ids, pack_channels_t)
+                if not channel_refs:
+                    continue
+
+                posts = await _fetch_unsent_posts(session, u.id, channel_refs, max_posts)
+                if not posts:
+                    continue
+
+                if dry:
+                    preview = _dry_preview_lines(posts, preview_n)
+                    if preview:
+                        logger.info("DRY preview user_tg=%s sample=%s", u.tg_id, preview)
+                    logger.info("DRY (no side effects) user_tg=%s would_send=%s", u.tg_id, len(posts))
+                    continue
+
+                msg = _build_message(posts, format_mode)
+
+                await bot.send_message(u.tg_id, msg)
+                await _mark_delivered(session, u.id, posts)
+                await _touch_last_sent(session, u.id)
+                sent_users += 1
+
+                await asyncio.sleep(0.4)
+            except Exception as e:
+                logger.exception("user send error tg_id=%s err=%s", u.tg_id, e)
+                await asyncio.sleep(0.2)
+
+    await bot.session.close()
+    logger.info("oneshot done: users_sent=%s", sent_users)
+
+
+async def _loop() -> None:
+    interval = _env_int("WORKER_INTERVAL_SEC", 300)
+    if interval <= 0:
+        interval = 300
+    logger.info("worker loop started interval=%ss", interval)
     while True:
-        time.sleep(10)
+        await _oneshot()
+        await asyncio.sleep(interval)
+
+
+def main() -> None:
+    import sys
+
+    cmd = (sys.argv[1] if len(sys.argv) > 1 else "").strip().lower()
+    if cmd in {"oneshot", "run-once"}:
+        asyncio.run(_oneshot())
+        return
+    asyncio.run(_loop())
+
 
 if __name__ == "__main__":
     main()

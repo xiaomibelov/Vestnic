@@ -13,3 +13,12 @@ node_modules/
 dist/
 build/
 .DS_Store
+
+zip/*.zip
+
+# vestnik local artifacts
+zip/run_*/
+zip/*.zip
+zip/*.log
+
+zip/
