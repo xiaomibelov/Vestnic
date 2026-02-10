@@ -424,9 +424,15 @@ async def _brain_generate_report_compat(
         kwargs["limit"] = int(limit)
 
     if _has("period_end"):
-        kwargs["period_end"] = period_end
+        try:
+            kwargs["period_end"] = period_end.isoformat()
+        except Exception:
+            kwargs["period_end"] = str(period_end)
     elif _has("period_end_iso"):
-        kwargs["period_end_iso"] = period_end.isoformat()
+        try:
+            kwargs["period_end_iso"] = period_end.isoformat()
+        except Exception:
+            kwargs["period_end_iso"] = str(period_end)
     elif _has("end"):
         kwargs["end"] = period_end
 
