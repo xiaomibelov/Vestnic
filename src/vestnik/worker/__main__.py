@@ -445,7 +445,25 @@ async def _brain_generate_report_compat(
 
     if _has("session"):
         return await fn(session=session, **kwargs)
-    return await fn(session, **kwargs)
+
+    sig = None
+    try:
+        import inspect
+        sig = inspect.signature(fn)
+    except Exception:
+        sig = None
+
+    if sig is not None:
+        import inspect
+        params = list(sig.parameters.values())
+        accepts_positional = any(
+            p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
+            for p in params
+        )
+        if accepts_positional:
+            return await fn(session, **kwargs)
+
+    return await fn(**kwargs)
 
 
 async def _find_report_id(
