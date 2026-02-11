@@ -4,6 +4,20 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
+from vestnik.settings import env_bool
+
+async def maybe_ensure_schema(session: AsyncSession) -> None:
+    # По умолчанию авто-DDL в рантайме выключен, чтобы не ловить lock waits.
+    if not env_bool("VESTNIK_SCHEMA_AUTO", False):
+        return
+    await ensure_schema(session)
+    # DDL транзакционный; страхуемся явным commit.
+    try:
+        await session.commit()
+    except Exception:
+        pass
+
+
 async def _get_table_columns(session: AsyncSession, table: str) -> set[str]:
     res = await session.execute(
         text(

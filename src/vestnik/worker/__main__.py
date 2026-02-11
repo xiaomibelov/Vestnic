@@ -11,7 +11,7 @@ from aiogram import Bot
 from sqlalchemy import text
 
 from vestnik.db import session_scope
-from vestnik.schema import ensure_schema
+from vestnik.schema import maybe_ensure_schema
 from vestnik.settings import BOT_TOKEN
 
 logging.basicConfig(level=logging.INFO)
@@ -583,7 +583,7 @@ async def _oneshot() -> None:
     brain_period_end = os.environ.get("WORKER_BRAIN_PERIOD_END", "").strip()
 
     async with session_scope() as session:
-        await ensure_schema(session)
+        await maybe_ensure_schema(session)
 
     target_tg = os.environ.get("WORKER_TARGET_TG_ID", "").strip()
 

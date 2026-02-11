@@ -23,6 +23,11 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
             pass
         raise
     finally:
+        try:
+            if session.in_transaction():
+                await session.rollback()
+        except Exception:
+            pass
         await session.close()
 
 

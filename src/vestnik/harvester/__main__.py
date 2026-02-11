@@ -11,7 +11,7 @@ from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 
 from vestnik.db import session_scope
-from vestnik.schema import ensure_schema
+from vestnik.schema import maybe_ensure_schema
 from vestnik.models import Channel, PostCache
 from vestnik.settings import (
     HARVESTER_ENABLED,
@@ -260,7 +260,7 @@ async def _harvest_one_channel(client: TelegramClient, ch: Channel) -> tuple[int
 
 async def _harvest_cycle(client: TelegramClient) -> int:
     async with session_scope() as session:
-        await ensure_schema(session)
+        await maybe_ensure_schema(session)
     channels = await _fetch_active_channels()
     logger.info("cycle: channels=%s", len(channels))
 
