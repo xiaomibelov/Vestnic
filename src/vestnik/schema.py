@@ -4,6 +4,29 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
+async def _get_table_columns(session: AsyncSession, table: str) -> set[str]:
+    res = await session.execute(
+        text(
+            """
+            select column_name
+            from information_schema.columns
+            where table_schema = current_schema()
+              and table_name = :t
+            """
+        ),
+        {"t": table},
+    )
+    return {str(r[0]) for r in res.fetchall()}
+
+
+async def _ensure_column(session: AsyncSession, cols: set[str], table: str, col: str, ddl: str) -> None:
+    # ВАЖНО: избегаем "ALTER ... IF NOT EXISTS" в steady-state,
+    # потому что сам ALTER берёт AccessExclusiveLock даже когда ничего не меняет.
+    if col in cols:
+        return
+    await session.execute(text(ddl))
+
+
 async def ensure_schema(session: AsyncSession) -> None:
     # users
     await session.execute(
@@ -21,12 +44,19 @@ async def ensure_schema(session: AsyncSession) -> None:
             """
         )
     )
-    await session.execute(text("alter table users add column if not exists tg_id bigint;"))
-    await session.execute(text("alter table users add column if not exists username varchar;"))
-    await session.execute(text("alter table users add column if not exists role varchar(32);"))
-    await session.execute(text("alter table users add column if not exists subscription_expires_at timestamptz;"))
-    await session.execute(text("alter table users add column if not exists referrer_tg_id bigint;"))
-    await session.execute(text("alter table users add column if not exists created_at timestamptz;"))
+    users_cols = await _get_table_columns(session, "users")
+    await _ensure_column(session, users_cols, "users", "tg_id", "alter table users add column tg_id bigint;")
+    await _ensure_column(session, users_cols, "users", "username", "alter table users add column username varchar;")
+    await _ensure_column(session, users_cols, "users", "role", "alter table users add column role varchar(32);")
+    await _ensure_column(
+        session,
+        users_cols,
+        "users",
+        "subscription_expires_at",
+        "alter table users add column subscription_expires_at timestamptz;",
+    )
+    await _ensure_column(session, users_cols, "users", "referrer_tg_id", "alter table users add column referrer_tg_id bigint;")
+    await _ensure_column(session, users_cols, "users", "created_at", "alter table users add column created_at timestamptz;")
     await session.execute(text("create unique index if not exists ux_users_tg_id on users(tg_id);"))
     await session.execute(text("create index if not exists ix_users_role on users(role);"))
 
@@ -43,9 +73,10 @@ async def ensure_schema(session: AsyncSession) -> None:
             """
         )
     )
-    await session.execute(text("alter table prompts add column if not exists key varchar(64);"))
-    await session.execute(text("alter table prompts add column if not exists text text;"))
-    await session.execute(text("alter table prompts add column if not exists updated_at timestamptz;"))
+    prompts_cols = await _get_table_columns(session, "prompts")
+    await _ensure_column(session, prompts_cols, "prompts", "key", "alter table prompts add column key varchar(64);")
+    await _ensure_column(session, prompts_cols, "prompts", "text", "alter table prompts add column text text;")
+    await _ensure_column(session, prompts_cols, "prompts", "updated_at", "alter table prompts add column updated_at timestamptz;")
     await session.execute(text("create unique index if not exists ux_prompts_key on prompts(key);"))
     await session.execute(text("create index if not exists ix_prompts_updated_at on prompts(updated_at);"))
 
@@ -67,14 +98,15 @@ async def ensure_schema(session: AsyncSession) -> None:
             """
         )
     )
-    await session.execute(text("alter table packs add column if not exists key varchar;"))
-    await session.execute(text("alter table packs add column if not exists title varchar;"))
-    await session.execute(text("alter table packs add column if not exists description text;"))
-    await session.execute(text("alter table packs add column if not exists tier varchar;"))
-    await session.execute(text("alter table packs add column if not exists prompt_id integer;"))
-    await session.execute(text("alter table packs add column if not exists schedule_time time;"))
-    await session.execute(text("alter table packs add column if not exists is_active boolean;"))
-    await session.execute(text("alter table packs add column if not exists created_at timestamptz;"))
+    packs_cols = await _get_table_columns(session, "packs")
+    await _ensure_column(session, packs_cols, "packs", "key", "alter table packs add column key varchar;")
+    await _ensure_column(session, packs_cols, "packs", "title", "alter table packs add column title varchar;")
+    await _ensure_column(session, packs_cols, "packs", "description", "alter table packs add column description text;")
+    await _ensure_column(session, packs_cols, "packs", "tier", "alter table packs add column tier varchar;")
+    await _ensure_column(session, packs_cols, "packs", "prompt_id", "alter table packs add column prompt_id integer;")
+    await _ensure_column(session, packs_cols, "packs", "schedule_time", "alter table packs add column schedule_time time;")
+    await _ensure_column(session, packs_cols, "packs", "is_active", "alter table packs add column is_active boolean;")
+    await _ensure_column(session, packs_cols, "packs", "created_at", "alter table packs add column created_at timestamptz;")
     await session.execute(text("create unique index if not exists ux_packs_key on packs(key);"))
     await session.execute(text("create index if not exists ix_packs_tier on packs(tier);"))
     await session.execute(text("create index if not exists ix_packs_is_active on packs(is_active);"))
@@ -96,15 +128,21 @@ async def ensure_schema(session: AsyncSession) -> None:
             """
         )
     )
-    await session.execute(text("alter table channels add column if not exists tg_channel_id bigint;"))
-    await session.execute(text("alter table channels add column if not exists username varchar;"))
-    await session.execute(text("alter table channels add column if not exists title varchar;"))
-    await session.execute(text("alter table channels add column if not exists is_active boolean;"))
-    await session.execute(text("alter table channels add column if not exists is_public boolean;"))
-    await session.execute(text("alter table channels add column if not exists added_by varchar(32);"))
-    await session.execute(text("alter table channels add column if not exists created_at timestamptz;"))
+    channels_cols = await _get_table_columns(session, "channels")
+    await _ensure_column(session, channels_cols, "channels", "tg_channel_id", "alter table channels add column tg_channel_id bigint;")
+    await _ensure_column(session, channels_cols, "channels", "username", "alter table channels add column username varchar;")
+    await _ensure_column(session, channels_cols, "channels", "title", "alter table channels add column title varchar;")
+    await _ensure_column(session, channels_cols, "channels", "is_active", "alter table channels add column is_active boolean;")
+    await _ensure_column(session, channels_cols, "channels", "is_public", "alter table channels add column is_public boolean;")
+    await _ensure_column(session, channels_cols, "channels", "added_by", "alter table channels add column added_by varchar(32);")
+    await _ensure_column(session, channels_cols, "channels", "created_at", "alter table channels add column created_at timestamptz;")
     await session.execute(text("create unique index if not exists ux_channels_username on channels(username);"))
-    await session.execute(text("create unique index if not exists ux_channels_tg_channel_id on channels(tg_channel_id) where tg_channel_id is not null;"))
+    await session.execute(
+        text(
+            "create unique index if not exists ux_channels_tg_channel_id on channels(tg_channel_id) "
+            "where tg_channel_id is not null;"
+        )
+    )
     await session.execute(text("create index if not exists ix_channels_is_active on channels(is_active);"))
 
     # pack_channels
@@ -120,9 +158,10 @@ async def ensure_schema(session: AsyncSession) -> None:
             """
         )
     )
-    await session.execute(text("alter table pack_channels add column if not exists pack_id integer;"))
-    await session.execute(text("alter table pack_channels add column if not exists channel_id integer;"))
-    await session.execute(text("alter table pack_channels add column if not exists created_at timestamptz;"))
+    pack_channels_cols = await _get_table_columns(session, "pack_channels")
+    await _ensure_column(session, pack_channels_cols, "pack_channels", "pack_id", "alter table pack_channels add column pack_id integer;")
+    await _ensure_column(session, pack_channels_cols, "pack_channels", "channel_id", "alter table pack_channels add column channel_id integer;")
+    await _ensure_column(session, pack_channels_cols, "pack_channels", "created_at", "alter table pack_channels add column created_at timestamptz;")
     await session.execute(text("create unique index if not exists ux_pack_channels_pair on pack_channels(pack_id, channel_id);"))
     await session.execute(text("create index if not exists ix_pack_channels_pack_id on pack_channels(pack_id);"))
 
@@ -140,10 +179,11 @@ async def ensure_schema(session: AsyncSession) -> None:
             """
         )
     )
-    await session.execute(text("alter table user_packs add column if not exists user_id integer;"))
-    await session.execute(text("alter table user_packs add column if not exists pack_id integer;"))
-    await session.execute(text("alter table user_packs add column if not exists is_enabled boolean;"))
-    await session.execute(text("alter table user_packs add column if not exists created_at timestamptz;"))
+    user_packs_cols = await _get_table_columns(session, "user_packs")
+    await _ensure_column(session, user_packs_cols, "user_packs", "user_id", "alter table user_packs add column user_id integer;")
+    await _ensure_column(session, user_packs_cols, "user_packs", "pack_id", "alter table user_packs add column pack_id integer;")
+    await _ensure_column(session, user_packs_cols, "user_packs", "is_enabled", "alter table user_packs add column is_enabled boolean;")
+    await _ensure_column(session, user_packs_cols, "user_packs", "created_at", "alter table user_packs add column created_at timestamptz;")
     await session.execute(text("create unique index if not exists ux_user_packs_pair on user_packs(user_id, pack_id);"))
     await session.execute(text("create index if not exists ix_user_packs_user_id on user_packs(user_id);"))
 
@@ -166,8 +206,9 @@ async def ensure_schema(session: AsyncSession) -> None:
             """
         )
     )
-    await session.execute(text("alter table posts_cache add column if not exists channel_id integer;"))
-    await session.execute(text("alter table posts_cache add column if not exists message_id_int integer;"))
+    posts_cache_cols = await _get_table_columns(session, "posts_cache")
+    await _ensure_column(session, posts_cache_cols, "posts_cache", "channel_id", "alter table posts_cache add column channel_id integer;")
+    await _ensure_column(session, posts_cache_cols, "posts_cache", "message_id_int", "alter table posts_cache add column message_id_int integer;")
     await session.execute(text("create index if not exists ix_posts_cache_channel_ref on posts_cache(channel_ref);"))
     await session.execute(text("create index if not exists ix_posts_cache_expires_at on posts_cache(expires_at);"))
     await session.execute(text("create unique index if not exists ux_posts_cache_pair on posts_cache(channel_ref, message_id);"))
@@ -207,10 +248,11 @@ async def ensure_schema(session: AsyncSession) -> None:
             """
         )
     )
-    await session.execute(text("alter table user_settings add column if not exists menu_chat_id bigint;"))
-    await session.execute(text("alter table user_settings add column if not exists menu_message_id integer;"))
-    await session.execute(text("alter table user_settings add column if not exists pause_until timestamptz;"))
-    await session.execute(text("alter table user_settings add column if not exists format_mode varchar(16);"))
+    user_settings_cols = await _get_table_columns(session, "user_settings")
+    await _ensure_column(session, user_settings_cols, "user_settings", "menu_chat_id", "alter table user_settings add column menu_chat_id bigint;")
+    await _ensure_column(session, user_settings_cols, "user_settings", "menu_message_id", "alter table user_settings add column menu_message_id integer;")
+    await _ensure_column(session, user_settings_cols, "user_settings", "pause_until", "alter table user_settings add column pause_until timestamptz;")
+    await _ensure_column(session, user_settings_cols, "user_settings", "format_mode", "alter table user_settings add column format_mode varchar(16);")
     await session.execute(text("update user_settings set format_mode='digest' where format_mode is null;"))
     await session.execute(text("create index if not exists ix_user_settings_delivery_enabled on user_settings(delivery_enabled);"))
     await session.execute(text("create index if not exists ix_user_settings_pause_until on user_settings(pause_until);"))
@@ -282,7 +324,6 @@ async def ensure_schema(session: AsyncSession) -> None:
     await session.execute(text("create index if not exists ix_payments_log_user_id on payments_log(user_id);"))
     await session.execute(text("create index if not exists ix_payments_log_created_at on payments_log(created_at);"))
 
-
     # reports (готовые отчёты; расширение ER-модели, поля не удаляем)
     await session.execute(
         text(
@@ -305,25 +346,32 @@ async def ensure_schema(session: AsyncSession) -> None:
     await session.execute(text("create index if not exists ix_reports_created_at on reports(created_at);"))
 
     # --- ai cache ddl (non-destructive) ---
-    for _stmt in [
-        '''CREATE TABLE IF NOT EXISTS post_facts (
-  id SERIAL PRIMARY KEY,
-  channel_ref TEXT NOT NULL,
-  message_id TEXT NOT NULL,
-  text_sha256 TEXT NOT NULL,
-  summary TEXT NOT NULL DEFAULT '',
-  url TEXT NOT NULL DEFAULT '',
-  channel_name TEXT NOT NULL DEFAULT '',
-  model TEXT NOT NULL DEFAULT '',
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE(channel_ref, message_id)
-)''',
-        '''CREATE INDEX IF NOT EXISTS idx_post_facts_updated_at ON post_facts(updated_at DESC)''',
-        '''ALTER TABLE reports ADD COLUMN IF NOT EXISTS input_hash TEXT''',
-        '''ALTER TABLE reports ADD COLUMN IF NOT EXISTS stage2_model TEXT''',
-        '''ALTER TABLE reports ADD COLUMN IF NOT EXISTS stage1_count INTEGER''',
-        '''CREATE INDEX IF NOT EXISTS idx_reports_pack_period ON reports(pack_key, period_start, period_end)''',
-        '''CREATE INDEX IF NOT EXISTS idx_reports_input_hash ON reports(input_hash)''',
-    ]:
-        await session.execute(text(_stmt))
+    await session.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS post_facts (
+              id SERIAL PRIMARY KEY,
+              channel_ref TEXT NOT NULL,
+              message_id TEXT NOT NULL,
+              text_sha256 TEXT NOT NULL,
+              summary TEXT NOT NULL DEFAULT '',
+              url TEXT NOT NULL DEFAULT '',
+              channel_name TEXT NOT NULL DEFAULT '',
+              model TEXT NOT NULL DEFAULT '',
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              UNIQUE(channel_ref, message_id)
+            )
+            """
+        )
+    )
+    await session.execute(text("CREATE INDEX IF NOT EXISTS idx_post_facts_updated_at ON post_facts(updated_at DESC)"))
+
+    reports_cols = await _get_table_columns(session, "reports")
+    await _ensure_column(session, reports_cols, "reports", "input_hash", "ALTER TABLE reports ADD COLUMN input_hash TEXT")
+    await _ensure_column(session, reports_cols, "reports", "stage2_model", "ALTER TABLE reports ADD COLUMN stage2_model TEXT")
+    await _ensure_column(session, reports_cols, "reports", "stage1_count", "ALTER TABLE reports ADD COLUMN stage1_count INTEGER")
+
+    await session.execute(text("CREATE INDEX IF NOT EXISTS idx_reports_pack_period ON reports(pack_key, period_start, period_end)"))
+    await session.execute(text("CREATE INDEX IF NOT EXISTS idx_reports_input_hash ON reports(input_hash)"))
+
     await session.commit()
