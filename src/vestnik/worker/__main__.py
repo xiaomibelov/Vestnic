@@ -52,18 +52,20 @@ async def _list_tables(session) -> set[str]:
         "where table_schema='public' and table_type='BASE TABLE'"
     )
     res = await session.execute(q)
-    return {r[0] for r in res.all()}
-
-
+    rows = res.all()
+    out = {r[0] for r in rows}
+    await session.commit()
+    return out
 async def _table_cols(session, table: str) -> set[str]:
     q = text(
         "select column_name from information_schema.columns "
         "where table_schema='public' and table_name=:t"
     )
     res = await session.execute(q, {"t": table})
-    return {r[0] for r in res.all()}
-
-
+    rows = res.all()
+    out = {r[0] for r in rows}
+    await session.commit()
+    return out
 def _pick_table(tables: set[str], candidates: list[str]) -> str | None:
     for t in candidates:
         if t in tables:
@@ -171,7 +173,9 @@ async def _get_user_settings(session, user_id: int) -> tuple[bool, int | None, d
         )
     ).first()
     if not row:
+        await session.commit()
         return True, None, None, None, "digest"
+    await session.commit()
     return bool(row[0]), (int(row[1]) if row[1] is not None else None), row[2], row[3], (str(row[4]) if row[4] else "digest")
 
 
@@ -209,9 +213,8 @@ async def _fetch_users(session) -> list[UserRow]:
     out: list[UserRow] = []
     for r in res.all():
         out.append(UserRow(id=int(r[0]), tg_id=int(r[1])))
+    await session.commit()
     return out
-
-
 async def _selected_pack_ids(session, user_id: int, user_packs_t: str) -> list[int]:
     cols = await _table_cols(session, user_packs_t)
 
@@ -228,9 +231,10 @@ async def _selected_pack_ids(session, user_id: int, user_packs_t: str) -> list[i
 
     sql = f"select {_safe_ident(pack_id_col)} from {_safe_ident(user_packs_t)} {where}"
     res = await session.execute(text(sql), {"uid": user_id})
-    return [int(r[0]) for r in res.all()]
-
-
+    rows = res.all()
+    out = [int(r[0]) for r in rows]
+    await session.commit()
+    return out
 async def _packs_for_ids(session, pack_ids: list[int]) -> list[dict[str, Any]]:
     if not pack_ids:
         return []
@@ -260,9 +264,8 @@ async def _packs_for_ids(session, pack_ids: list[int]) -> list[dict[str, Any]]:
                 "pack_title": (str(r[2]) if title_col and r[2] is not None else str(r[1])),
             }
         )
+    await session.commit()
     return out
-
-
 async def _channels_for_pack_ids(session, pack_ids: list[int], pack_channels_t: str) -> list[str]:
     if not pack_ids:
         return []
@@ -310,9 +313,8 @@ async def _fetch_unsent_posts(session, user_id: int, channel_refs: list[str], li
     out: list[PostRow] = []
     for r in res.all():
         out.append(PostRow(channel_ref=str(r[0]), message_id=str(r[1]), text=str(r[2] or ""), url=str(r[3] or "")))
+    await session.commit()
     return out
-
-
 async def _mark_delivered_posts(session, user_id: int, posts: list[PostRow]) -> None:
     if not posts:
         return
@@ -516,6 +518,7 @@ async def _find_report_id(
     )
     row = (await session.execute(q, params)).first()
     if row:
+        await session.commit()
         return int(row[0])
 
     q2 = text(
@@ -528,6 +531,7 @@ async def _find_report_id(
         """
     )
     row2 = (await session.execute(q2, {"uid": user_id, "pk": pack_key})).first()
+    await session.commit()
     return int(row2[0]) if row2 else None
 
 
