@@ -1,3 +1,13 @@
+cd "$(git rev-parse --show-toplevel)"
+
+TS="$(date +%F_%H%M%S)"
+TAG="cp/apply_schema_init_cli_and_deploy_checklist_v1_start_${TS}"
+git tag -a "$TAG" -m "checkpoint: apply schema init cli + deploy checklist v1 start (${TS})" >/dev/null 2>&1 || true
+echo "checkpoint tag: $TAG"
+
+mkdir -p scripts src/vestnik docs
+
+cat > src/vestnik/schema.py <<'PY'
 from __future__ import annotations
 
 import argparse
@@ -464,3 +474,61 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+PY
+
+cat > docs/deploy_checklist.md <<'MD'
+# Vestnik deploy checklist
+
+## Policy
+- **Runtime DDL запрещён**: все сервисы в обычном запуске должны работать с `VESTNIK_SCHEMA_AUTO=0`.
+- **DDL только отдельным шагом**: `python -m vestnik.schema init`.
+
+## Preflight
+- `git status -sb` (чисто)
+- при необходимости: `docker compose pull` (если у тебя так принято)
+
+## Build
+- `docker compose build --no-cache worker`
+
+## DB schema (единственный DDL шаг)
+- `docker compose run --rm -e VESTNIK_SCHEMA_AUTO=1 worker python -m vestnik.schema init`
+- проверка:
+  - `docker compose run --rm worker python -m vestnik.schema check`
+
+## Runtime (DDL off)
+- В `.env`/compose:
+  - `VESTNIK_SCHEMA_AUTO=0`
+- Старт сервисов (по твоей схеме: `up -d`, systemd, etc.)
+
+## Smoke
+- `docker compose run --rm -e VESTNIK_SCHEMA_AUTO=0 worker python -m vestnik.worker oneshot`
+- Если нужна быстрая проверка БД:
+  - `docker compose run --rm worker python -m vestnik.schema check`
+MD
+
+echo
+echo "== py_compile =="
+python -m py_compile src/vestnik/schema.py || true
+python -m py_compile src/vestnik/db.py || true
+
+echo
+echo "== docker rebuild worker (no cache) =="
+docker compose build --no-cache worker
+
+echo
+echo "== verify: schema check =="
+docker compose run --rm worker python -m vestnik.schema check || true
+
+echo
+echo "== verify: oneshot (noschema) =="
+docker compose run --rm -e VESTNIK_SCHEMA_AUTO=0 worker python -m vestnik.worker oneshot || true
+
+echo
+echo "== git diff --stat =="
+git diff --stat || true
+
+echo
+echo "== next manual deploy steps =="
+echo "1) docker compose run --rm -e VESTNIK_SCHEMA_AUTO=1 worker python -m vestnik.schema init"
+echo "2) docker compose run --rm worker python -m vestnik.schema check"
+echo "3) ensure runtime has VESTNIK_SCHEMA_AUTO=0"

@@ -1,27 +1,14 @@
-.env
-.env.*
-*.session
-*.key
-*.pem
-*id_rsa*
-*id_ed25519*
-__pycache__/
-*.pyc
-.venv/
-venv/
-node_modules/
-dist/
-build/
-.DS_Store
+cd "$(git rev-parse --show-toplevel)"
 
-zip/*.zip
+TS="$(date +%F_%H%M%S)"
+TAG="cp/ignore_local_debug_scripts_start_${TS}"
+git tag -a "$TAG" -m "checkpoint: ignore local debug scripts start (${TS})" >/dev/null 2>&1 || true
+echo "checkpoint tag: $TAG"
 
-# vestnik local artifacts
-zip/run_*/
-zip/*.zip
-zip/*.log
+touch .gitignore
 
-zip/
+# добавим блок (один раз)
+grep -q "VESTNIK LOCAL DEBUG SCRIPTS" .gitignore || cat >> .gitignore <<'EOF'
 
 # VESTNIK LOCAL DEBUG SCRIPTS (generated during incident work)
 scripts/cli_introspect_worker.sh
@@ -37,3 +24,8 @@ scripts/run_worker_oneshot_noschema_and_verify.sh
 scripts/diag_locks_ab.sh
 scripts/apply_add_diag_locks_cli_v1.sh
 scripts/db_terminate_suspicious_idle_pid_2196.sh
+EOF
+
+echo
+echo "== git status =="
+git status -sb || true
