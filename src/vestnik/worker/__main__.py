@@ -386,6 +386,21 @@ def _coerce_dt(v: Any) -> datetime | None:
     return None
 
 
+async def _release_read_txn(session) -> None:
+    """
+    SQLAlchemy AsyncSession (asyncpg) keeps a transaction open after SELECT.
+    Postgres relation locks (e.g. AccessShareLock on packs) are held until txn ends,
+    which can block DDL (AccessExclusiveLock) in ensure_schema from other processes.
+    """
+    try:
+        await session.rollback()
+    except Exception:
+        try:
+            await session.commit()
+        except Exception:
+            pass
+
+
 async def _brain_generate_report_compat(
     session,
     *,
@@ -396,7 +411,6 @@ async def _brain_generate_report_compat(
     snap: str,
     user_tg_id: int,
 ) -> Any:
-    # Import lazily to avoid tight coupling.
     from vestnik.brain import pipeline as bp  # type: ignore
 
     fn = getattr(bp, "generate_report", None)
@@ -504,7 +518,6 @@ async def _find_report_id(
     if row:
         return int(row[0])
 
-    # Fallback: latest for user+pack
     q2 = text(
         """
         select id
@@ -519,7 +532,6 @@ async def _find_report_id(
 
 
 async def _reserve_report_delivery(session, *, user_id: int, report_id: int) -> bool:
-    # True => reserved (not sent before). False => already sent.
     row = (
         await session.execute(
             text(
@@ -583,7 +595,10 @@ async def _oneshot() -> None:
         await _ensure_user_settings(session)
 
         user_packs_t, pack_channels_t = await _resolve_pack_tables(session)
+        await _release_read_txn(session)
+
         users = await _fetch_users(session)
+        await _release_read_txn(session)
 
         if target_tg:
             try:
@@ -605,6 +620,8 @@ async def _oneshot() -> None:
         for u in users:
             try:
                 delivery_enabled, interval_sec, last_sent_at, pause_until, format_mode = await _get_user_settings(session, u.id)
+                await _release_read_txn(session)
+
                 if not delivery_enabled:
                     continue
 
@@ -618,7 +635,6 @@ async def _oneshot() -> None:
                     except Exception:
                         pass
 
-                # Default interval guard (if DB null) to avoid spamming.
                 if interval_sec is None:
                     interval_sec = int(default_interval_sec)
 
@@ -628,6 +644,8 @@ async def _oneshot() -> None:
                         continue
 
                 pack_ids = await _selected_pack_ids(session, u.id, user_packs_t)
+                await _release_read_txn(session)
+
                 if not pack_ids:
                     continue
 
@@ -635,14 +653,14 @@ async def _oneshot() -> None:
                     await _ensure_report_deliveries_table(session)
 
                     packs = await _packs_for_ids(session, pack_ids)
+                    await _release_read_txn(session)
+
                     if not packs:
                         continue
 
-                    # Determine period_end
                     pe = datetime.now(timezone.utc)
                     if brain_period_end:
                         try:
-                            # Let brain accept ISO; we also keep datetime for our local logs.
                             pe = datetime.fromisoformat(brain_period_end.replace("Z", "+00:00"))
                             if pe.tzinfo is None:
                                 pe = pe.replace(tzinfo=timezone.utc)
@@ -652,7 +670,6 @@ async def _oneshot() -> None:
                     any_sent = False
                     for p in packs:
                         pack_key = str(p["pack_key"])
-                        pack_title = str(p.get("pack_title") or pack_key)
 
                         res = await _brain_generate_report_compat(
                             session,
@@ -670,7 +687,6 @@ async def _oneshot() -> None:
                         pe2 = None
 
                         if isinstance(res, tuple) and res:
-                            # not expected, but keep safe
                             report_text = str(res[0] or "")
                         else:
                             report_text = str(getattr(res, "report_text", "") or getattr(res, "text", "") or "")
@@ -690,6 +706,8 @@ async def _oneshot() -> None:
                             period_end=pe2,
                             input_hash=(str(input_hash) if input_hash else None),
                         )
+                        await _release_read_txn(session)
+
                         if report_id is None:
                             logger.warning("brain report: cannot resolve report_id user_id=%s pack=%s", u.id, pack_key)
                             continue
@@ -719,13 +737,17 @@ async def _oneshot() -> None:
                         sent_users += 1
                     continue
 
-                # Default: posts mode (existing behaviour)
                 await _ensure_deliveries_table(session)
+
                 channel_refs = await _channels_for_pack_ids(session, pack_ids, pack_channels_t)
+                await _release_read_txn(session)
+
                 if not channel_refs:
                     continue
 
                 posts = await _fetch_unsent_posts(session, u.id, channel_refs, max_posts)
+                await _release_read_txn(session)
+
                 if not posts:
                     continue
 
