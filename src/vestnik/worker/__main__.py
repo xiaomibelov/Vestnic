@@ -285,6 +285,7 @@ async def _channels_for_pack_ids(session, pack_ids: list[int], pack_channels_t: 
     )
     res = await session.execute(text(sql), {"pids": pack_ids})
     usernames = [str(r[0]) for r in res.all()]
+    await session.commit()
     return [u.lstrip("@") for u in usernames]
 
 
