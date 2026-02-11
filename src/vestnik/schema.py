@@ -223,6 +223,9 @@ async def ensure_schema(session: AsyncSession) -> None:
     posts_cache_cols = await _get_table_columns(session, "posts_cache")
     await _ensure_column(session, posts_cache_cols, "posts_cache", "channel_id", "alter table posts_cache add column channel_id integer;")
     await _ensure_column(session, posts_cache_cols, "posts_cache", "message_id_int", "alter table posts_cache add column message_id_int bigint;")
+    await _ensure_column(session, posts_cache_cols, "posts_cache", "message_date", "alter table posts_cache add column message_date timestamptz;")
+    await _ensure_column(session, posts_cache_cols, "posts_cache", "message_text", "alter table posts_cache add column message_text text;")
+    await _ensure_column(session, posts_cache_cols, "posts_cache", "created_at", "alter table posts_cache add column created_at timestamptz;")
     await session.execute(text("create index if not exists ix_posts_cache_channel_id on posts_cache(channel_id);"))
     await session.execute(text("create index if not exists ix_posts_cache_message_date on posts_cache(message_date);"))
 
@@ -408,7 +411,7 @@ async def check_schema(session: AsyncSession) -> dict[str, Any]:
         "channels": ["tg_channel_id", "username", "title", "is_public", "is_active", "added_by", "created_at"],
         "pack_channels": ["pack_id", "channel_id", "created_at"],
         "user_packs": ["user_id", "pack_id", "is_enabled", "created_at"],
-        "posts_cache": ["channel_id", "message_id_int"],
+        "posts_cache": ["channel_id", "message_id_int", "message_date"],
         "user_settings": ["pause_until", "format_mode", "menu_chat_id", "menu_message_id"],
         "reports": ["input_hash", "stage1_count", "stage2_model"],
     }
