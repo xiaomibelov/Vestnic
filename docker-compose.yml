@@ -15,10 +15,34 @@ services:
     ports:
       - "6379:6379"
 
+  # --- schema tooling (explicit, no runtime DDL) ---
+  schema_check:
+    build: .
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    profiles: ["tools"]
+    command: ["python", "-m", "vestnik.schema", "check"]
+
+  schema_init:
+    build: .
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    profiles: ["tools"]
+    command: ["python", "-m", "vestnik.schema", "init"]
+
+  # --- app services (runtime must NOT do schema DDL) ---
   bot:
     build: .
     env_file:
       - .env
+    environment:
+      VESTNIK_SCHEMA_AUTO: "0"
     depends_on:
       - db
       - redis
@@ -28,6 +52,8 @@ services:
     build: .
     env_file:
       - .env
+    environment:
+      VESTNIK_SCHEMA_AUTO: "0"
     depends_on:
       - db
       - redis
@@ -37,6 +63,8 @@ services:
     build: .
     env_file:
       - .env
+    environment:
+      VESTNIK_SCHEMA_AUTO: "0"
     depends_on:
       - db
       - redis
@@ -46,6 +74,8 @@ services:
     build: .
     env_file:
       - .env
+    environment:
+      VESTNIK_SCHEMA_AUTO: "0"
     depends_on:
       - db
       - redis

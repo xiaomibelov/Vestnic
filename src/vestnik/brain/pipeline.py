@@ -9,7 +9,7 @@ import sqlalchemy as sa
 from sqlalchemy import text
 
 from vestnik.db import session_scope
-from vestnik.schema import ensure_schema
+from vestnik.schema import maybe_ensure_schema
 from vestnik.settings import (
     AI_CACHE_ENABLED,
     AI_ENABLED,
@@ -347,7 +347,7 @@ async def generate_report(
     )
 
     async with session_scope() as session:
-        await ensure_schema(session)
+        await maybe_ensure_schema(session)
 
         pack_id, pack_title = await _load_pack(session, pack_key)
         prompt_text = await _load_prompt(session, pack_key)

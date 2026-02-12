@@ -1,3 +1,13 @@
+cd "$(git rev-parse --show-toplevel)"
+
+TS="$(date +%F_%H%M%S)"
+TAG="cp/apply_schema_init_cli_and_deploy_checklist_v1_start_${TS}"
+git tag -a "$TAG" -m "checkpoint: apply schema init cli + deploy checklist v1 start (${TS})" >/dev/null 2>&1 || true
+echo "checkpoint tag: $TAG"
+
+mkdir -p scripts src/vestnik docs
+
+cat > src/vestnik/schema.py <<'PY'
 from __future__ import annotations
 
 import argparse
@@ -223,9 +233,6 @@ async def ensure_schema(session: AsyncSession) -> None:
     posts_cache_cols = await _get_table_columns(session, "posts_cache")
     await _ensure_column(session, posts_cache_cols, "posts_cache", "channel_id", "alter table posts_cache add column channel_id integer;")
     await _ensure_column(session, posts_cache_cols, "posts_cache", "message_id_int", "alter table posts_cache add column message_id_int bigint;")
-    await _ensure_column(session, posts_cache_cols, "posts_cache", "message_date", "alter table posts_cache add column message_date timestamptz;")
-    await _ensure_column(session, posts_cache_cols, "posts_cache", "message_text", "alter table posts_cache add column message_text text;")
-    await _ensure_column(session, posts_cache_cols, "posts_cache", "created_at", "alter table posts_cache add column created_at timestamptz;")
     await session.execute(text("create index if not exists ix_posts_cache_channel_id on posts_cache(channel_id);"))
     await session.execute(text("create index if not exists ix_posts_cache_message_date on posts_cache(message_date);"))
 
@@ -246,16 +253,6 @@ async def ensure_schema(session: AsyncSession) -> None:
             """
         )
     )
-    
-    deliveries_cols = await _get_table_columns(session, "deliveries")
-    await _ensure_column(session, deliveries_cols, "deliveries", "user_id", "alter table deliveries add column user_id integer;")
-    await _ensure_column(session, deliveries_cols, "deliveries", "pack_id", "alter table deliveries add column pack_id integer;")
-    await _ensure_column(session, deliveries_cols, "deliveries", "channel_id", "alter table deliveries add column channel_id integer;")
-    await _ensure_column(session, deliveries_cols, "deliveries", "post_id", "alter table deliveries add column post_id varchar;")
-    await _ensure_column(session, deliveries_cols, "deliveries", "status", "alter table deliveries add column status varchar(32);")
-    await _ensure_column(session, deliveries_cols, "deliveries", "error", "alter table deliveries add column error text;")
-    await _ensure_column(session, deliveries_cols, "deliveries", "created_at", "alter table deliveries add column created_at timestamptz;")
-
     await session.execute(text("create index if not exists ix_deliveries_user_id on deliveries(user_id);"))
     await session.execute(text("create index if not exists ix_deliveries_pack_id on deliveries(pack_id);"))
     await session.execute(text("create index if not exists ix_deliveries_status on deliveries(status);"))
@@ -302,14 +299,6 @@ async def ensure_schema(session: AsyncSession) -> None:
     )
     await session.execute(text("create index if not exists ix_subscriptions_user_id on subscriptions(user_id);"))
     await session.execute(text("create index if not exists ix_subscriptions_tier on subscriptions(tier);"))
-    
-    subscriptions_cols = await _get_table_columns(session, "subscriptions")
-    await _ensure_column(session, subscriptions_cols, "subscriptions", "user_id", "alter table subscriptions add column user_id integer;")
-    await _ensure_column(session, subscriptions_cols, "subscriptions", "starts_at", "alter table subscriptions add column starts_at timestamptz;")
-    await _ensure_column(session, subscriptions_cols, "subscriptions", "ends_at", "alter table subscriptions add column ends_at timestamptz;")
-    await _ensure_column(session, subscriptions_cols, "subscriptions", "status", "alter table subscriptions add column status varchar(32);")
-    await _ensure_column(session, subscriptions_cols, "subscriptions", "created_at", "alter table subscriptions add column created_at timestamptz;")
-
     await session.execute(text("create index if not exists ix_subscriptions_ends_at on subscriptions(ends_at);"))
 
     # user_channels
@@ -429,8 +418,7 @@ async def check_schema(session: AsyncSession) -> dict[str, Any]:
         "channels": ["tg_channel_id", "username", "title", "is_public", "is_active", "added_by", "created_at"],
         "pack_channels": ["pack_id", "channel_id", "created_at"],
         "user_packs": ["user_id", "pack_id", "is_enabled", "created_at"],
-        "posts_cache": ["channel_id", "message_id_int", "message_date"],
-        "subscriptions": ["user_id", "starts_at", "ends_at", "status", "created_at"],
+        "posts_cache": ["channel_id", "message_id_int"],
         "user_settings": ["pause_until", "format_mode", "menu_chat_id", "menu_message_id"],
         "reports": ["input_hash", "stage1_count", "stage2_model"],
     }
@@ -486,3 +474,61 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+PY
+
+cat > docs/deploy_checklist.md <<'MD'
+# Vestnik deploy checklist
+
+## Policy
+- **Runtime DDL запрещён**: все сервисы в обычном запуске должны работать с `VESTNIK_SCHEMA_AUTO=0`.
+- **DDL только отдельным шагом**: `python -m vestnik.schema init`.
+
+## Preflight
+- `git status -sb` (чисто)
+- при необходимости: `docker compose pull` (если у тебя так принято)
+
+## Build
+- `docker compose build --no-cache worker`
+
+## DB schema (единственный DDL шаг)
+- `docker compose run --rm -e VESTNIK_SCHEMA_AUTO=1 worker python -m vestnik.schema init`
+- проверка:
+  - `docker compose run --rm worker python -m vestnik.schema check`
+
+## Runtime (DDL off)
+- В `.env`/compose:
+  - `VESTNIK_SCHEMA_AUTO=0`
+- Старт сервисов (по твоей схеме: `up -d`, systemd, etc.)
+
+## Smoke
+- `docker compose run --rm -e VESTNIK_SCHEMA_AUTO=0 worker python -m vestnik.worker oneshot`
+- Если нужна быстрая проверка БД:
+  - `docker compose run --rm worker python -m vestnik.schema check`
+MD
+
+echo
+echo "== py_compile =="
+python -m py_compile src/vestnik/schema.py || true
+python -m py_compile src/vestnik/db.py || true
+
+echo
+echo "== docker rebuild worker (no cache) =="
+docker compose build --no-cache worker
+
+echo
+echo "== verify: schema check =="
+docker compose run --rm worker python -m vestnik.schema check || true
+
+echo
+echo "== verify: oneshot (noschema) =="
+docker compose run --rm -e VESTNIK_SCHEMA_AUTO=0 worker python -m vestnik.worker oneshot || true
+
+echo
+echo "== git diff --stat =="
+git diff --stat || true
+
+echo
+echo "== next manual deploy steps =="
+echo "1) docker compose run --rm -e VESTNIK_SCHEMA_AUTO=1 worker python -m vestnik.schema init"
+echo "2) docker compose run --rm worker python -m vestnik.schema check"
+echo "3) ensure runtime has VESTNIK_SCHEMA_AUTO=0"
