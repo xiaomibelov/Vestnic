@@ -1,5 +1,23 @@
 # Vestnik deploy checklist
 
+
+## DB schema (explicit)
+
+1) Ensure DB/Redis are up:
+   docker compose up -d db redis
+
+2) Validate schema:
+   docker compose --profile tools run --rm schema_check
+
+3) Apply schema (idempotent):
+   docker compose --profile tools run --rm schema_init
+
+4) Validate again (must be ok):
+   docker compose --profile tools run --rm schema_check
+
+Note: runtime services must run with VESTNIK_SCHEMA_AUTO=0 (no automatic DDL).
+
+
 ## Policy
 - **Runtime DDL запрещён**: все сервисы в обычном запуске должны работать с `VESTNIK_SCHEMA_AUTO=0`.
 - **DDL только отдельным шагом**: `python -m vestnik.schema init`.
