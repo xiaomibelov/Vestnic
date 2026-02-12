@@ -28,3 +28,6 @@ admin_frontend/dist/
 admin_frontend/.env.local
 admin_frontend/.env.*.local
 admin_frontend/.DS_Store
+
+# local helper scripts (untracked)
+scripts/
