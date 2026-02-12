@@ -37,3 +37,5 @@ scripts/run_worker_oneshot_noschema_and_verify.sh
 scripts/diag_locks_ab.sh
 scripts/apply_add_diag_locks_cli_v1.sh
 scripts/db_terminate_suspicious_idle_pid_2196.sh
+
+/admin_frontend/
