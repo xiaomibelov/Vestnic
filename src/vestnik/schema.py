@@ -302,6 +302,14 @@ async def ensure_schema(session: AsyncSession) -> None:
     )
     await session.execute(text("create index if not exists ix_subscriptions_user_id on subscriptions(user_id);"))
     await session.execute(text("create index if not exists ix_subscriptions_tier on subscriptions(tier);"))
+    
+    subscriptions_cols = await _get_table_columns(session, "subscriptions")
+    await _ensure_column(session, subscriptions_cols, "subscriptions", "user_id", "alter table subscriptions add column user_id integer;")
+    await _ensure_column(session, subscriptions_cols, "subscriptions", "starts_at", "alter table subscriptions add column starts_at timestamptz;")
+    await _ensure_column(session, subscriptions_cols, "subscriptions", "ends_at", "alter table subscriptions add column ends_at timestamptz;")
+    await _ensure_column(session, subscriptions_cols, "subscriptions", "status", "alter table subscriptions add column status varchar(32);")
+    await _ensure_column(session, subscriptions_cols, "subscriptions", "created_at", "alter table subscriptions add column created_at timestamptz;")
+
     await session.execute(text("create index if not exists ix_subscriptions_ends_at on subscriptions(ends_at);"))
 
     # user_channels
@@ -422,6 +430,7 @@ async def check_schema(session: AsyncSession) -> dict[str, Any]:
         "pack_channels": ["pack_id", "channel_id", "created_at"],
         "user_packs": ["user_id", "pack_id", "is_enabled", "created_at"],
         "posts_cache": ["channel_id", "message_id_int", "message_date"],
+        "subscriptions": ["user_id", "starts_at", "ends_at", "status", "created_at"],
         "user_settings": ["pause_until", "format_mode", "menu_chat_id", "menu_message_id"],
         "reports": ["input_hash", "stage1_count", "stage2_model"],
     }
