@@ -246,6 +246,16 @@ async def ensure_schema(session: AsyncSession) -> None:
             """
         )
     )
+    
+    deliveries_cols = await _get_table_columns(session, "deliveries")
+    await _ensure_column(session, deliveries_cols, "deliveries", "user_id", "alter table deliveries add column user_id integer;")
+    await _ensure_column(session, deliveries_cols, "deliveries", "pack_id", "alter table deliveries add column pack_id integer;")
+    await _ensure_column(session, deliveries_cols, "deliveries", "channel_id", "alter table deliveries add column channel_id integer;")
+    await _ensure_column(session, deliveries_cols, "deliveries", "post_id", "alter table deliveries add column post_id varchar;")
+    await _ensure_column(session, deliveries_cols, "deliveries", "status", "alter table deliveries add column status varchar(32);")
+    await _ensure_column(session, deliveries_cols, "deliveries", "error", "alter table deliveries add column error text;")
+    await _ensure_column(session, deliveries_cols, "deliveries", "created_at", "alter table deliveries add column created_at timestamptz;")
+
     await session.execute(text("create index if not exists ix_deliveries_user_id on deliveries(user_id);"))
     await session.execute(text("create index if not exists ix_deliveries_pack_id on deliveries(pack_id);"))
     await session.execute(text("create index if not exists ix_deliveries_status on deliveries(status);"))
