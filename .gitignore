@@ -22,3 +22,9 @@ zip/*.zip
 zip/*.log
 
 zip/
+# admin_frontend (vite/react)
+admin_frontend/node_modules/
+admin_frontend/dist/
+admin_frontend/.env.local
+admin_frontend/.env.*.local
+admin_frontend/.DS_Store
