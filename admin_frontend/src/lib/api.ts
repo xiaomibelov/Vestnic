@@ -31,7 +31,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  base: BASE,
   get: <T>(path: string) => request<T>(path),
   post: <T>(path: string, body?: any) =>
     request<T>(path, { method: "POST", body: body ? JSON.stringify(body) : undefined }),
+
+  health: () => request<{ ok: boolean }>("/health"),
 };
